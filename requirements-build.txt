@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Desktop packaging only: creates the self-contained backend executable.
+pyinstaller>=6.22,<7

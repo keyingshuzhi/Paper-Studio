@@ -1,0 +1,9 @@
+# 学术研究助理 Agent (V1.0) 依赖
+# 核心 HTTP 客户端
+requests>=2.31.0
+
+# PDF 文本抽取（可选，但强烈建议安装）
+pypdf>=4.0.0
+
+# Model Context Protocol Python SDK（v2 稳定版）
+mcp[cli]>=2.0.0,<3.0.0
