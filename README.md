@@ -1,7 +1,22 @@
-# Paper Studio 学术研究 Agent（v0.0.4）
+# Paper Studio 学术研究 Agent（v0.1.0）
 
 根据用户输入的关键词（或自然语言指令），跨多个权威平台检索、去重、排序学术文献，
 并可下载论文原文、抽取文本、生成结构化研究报告。
+
+## v0.1.0 体验升级
+
+- 全新的 Paper Studio 品牌 Logo 与桌面图标，统一 Web、macOS 和 Windows 视觉识别。
+- 移除 Web / App 的成本页面、预算表单、费用图表与调用明细，让工作区专注于研究本身。
+- 模型设置升级为服务商档案：内置 Ollama、DeepSeek、OpenAI、OpenRouter、硅基流动、智谱、阿里百炼、火山方舟与 OneAPI，并可添加、编辑或删除任意 OpenAI 兼容服务商及其模型。
+- 每个服务商可独立配置 Base URL、模型列表、默认模型、环境变量和 API Key；模型设置会持久化为安全的 `model_config.json`，桌面版使用 Electron `safeStorage` 加密保存多组凭据并在启动时自动恢复。
+- Python 依赖与项目内虚拟环境统一交由 uv 管理；桌面打包自动使用 uv 的 `build` 依赖组。
+- 重构导航、研究工作区、对比研究、报告阅读器、设置中心、浅色/暗色主题、反馈提示和响应式交互；新增 Web/App 共用的品牌启动动画，并兼容系统主题与“减少动态效果”偏好。
+- 研究任务新增本机恢复队列：保存输入、选项、日志、结构化执行轨迹和安全检查点；Web/App 意外关闭后可在任务中心继续。
+- 云端模型支持草稿级真实推理检测、短暂故障自动重试，以及在已配置的兼容云服务商之间自动故障切换。
+- 文献库升级为本地阅读工作台：PDF 预览配合可选择的抽取文本，支持高亮、批注、摘录、标签、页码与引用/关键词定位；所有笔记仅保存在应用数据目录。
+- 报告页支持章节目录、已下载文献跳转、不可变版本快照与恢复，以及离线导出 Markdown、Word 和 PDF。
+- 可勾选已有本地文献启动“已有文献续研”，复用原文与元数据进行总结、对比和报告，不再重复外部检索。
+- 文献列表提供可解释的辅助质量评分，综合来源、年份、引用量、全文可用性、重复度与查询相关性；评分不替代同行评审。
 
 ## 架构（DSH 三层）
 
@@ -90,8 +105,32 @@ else:
 | 记忆查询 | `memory_search` / `memory_read` / `memory_stats` | 文件读取 |
 | 记忆变更 | `memory_write` / `memory_delete` / `memory_clear` | 文件写入；删除操作另需 destructive 权限 |
 | 报告生成 | `report_render` / `report_write` | 纯渲染无权限；落盘需要文件写入 |
+| 本地文献库 RAG | `library_rag` | 网络（embedding 调用）、文件读写 |
 
 记忆和报告特意拆分成只读、写入和删除入口，便于 MCP 宿主按最小权限授权。
+
+## 本地文献库 RAG（v0.1.0）
+
+仅基于已下载的 PDF 回答问题，结论带页码和原文引用片段，**不引入新依赖**：
+
+- **Embedding**：复用现有 LLM 服务商配置。优先本地 Ollama（`nomic-embed-text` /
+  `mxbai-embed-large`），可降级到任意 OpenAI 兼容云端。
+- **索引存储**：纯 JSON（`downloads/library_index.json`），原子写不损坏。
+- **检索**：纯标准库余弦相似度，论文级数据集毫秒级返回。
+- **增量**：按 PDF 文件指纹跳过未变化文件，切换 embedding 模型自动重建。
+
+```python
+from agent.skills import LibraryRagSkill
+
+rag = LibraryRagSkill(index_path="downloads/library_index.json")
+rag.build_index()                  # 扫描 downloads/*/papers/*.pdf 建索引
+hits = rag.query("Mamba 的核心思想是什么?", top_k=5)
+answer = rag.ask("Mamba 与 Transformer 的核心区别是什么?")
+# answer["answer"]    文本回答
+# answer["citations"] 引用列表,含 paper_id / page / quote / score
+```
+
+在 Web/桌面界面暴露的"文献库对话"页可作为后续任务实现。
 报告写入 Skill 只接受不含目录的 `.md` 文件名，阻止通过文件名越出指定报告目录。
 
 ## MCP Server
@@ -130,13 +169,14 @@ Web/App 的同一任务中心：
 
 研究控制要求 Paper Studio Web 版或桌面 App 正在运行。Web 后端会在应用数据目录
 原子发布仅含本机端口和随机令牌的 `mcp_runtime.json`（权限 `0600`），MCP 只连接
-`127.0.0.1` 的专用鉴权接口。任务会直接出现在 App 任务队列中；关闭应用后，当前
-进程内任务状态结束，但已经生成的报告、文献和成本账本仍会保留。
+`127.0.0.1` 的专用鉴权接口。任务会直接出现在 App 任务队列中；关闭应用后，运行中
+任务会被恢复为“待恢复”，保留最后一个安全检查点、输入、日志与执行轨迹。用户确认继续后，
+系统从可安全重放的边界重新调度，不会把中途的网络请求误标记为已完成。
 
 直接启动（stdio 不监听端口）：
 
 ```bash
-.venv/bin/python -B -m agent.mcp_server
+uv run python -B -m agent.mcp_server
 ```
 
 宿主配置示例。stdio 宿主应使用绝对路径；`PAPER_STUDIO_DATA_DIR` 可指向 Web
@@ -147,8 +187,8 @@ Web/App 的同一任务中心：
 {
   "mcpServers": {
     "paper-studio": {
-      "command": "/绝对路径/paper-studio/.venv/bin/python",
-      "args": ["-B", "-m", "agent.mcp_server"],
+      "command": "uv",
+      "args": ["run", "--directory", "/绝对路径/paper-studio", "python", "-B", "-m", "agent.mcp_server"],
       "env": {
         "PYTHONPATH": "/绝对路径/paper-studio",
         "PAPER_STUDIO_DATA_DIR": "/绝对路径/Paper Studio/downloads"
@@ -161,9 +201,9 @@ Web/App 的同一任务中心：
 协议与控制链路验证：
 
 ```bash
-.venv/bin/python -B examples/test_mcp_server.py
-.venv/bin/python -B examples/test_mcp_control.py
-.venv/bin/python -B examples/test_mcp_permissions.py
+uv run python -B examples/test_mcp_server.py
+uv run python -B examples/test_mcp_control.py
+uv run python -B examples/test_mcp_permissions.py
 ```
 
 ### MCP Client（外部连接）
@@ -202,60 +242,64 @@ Authorization=PAPER_STUDIO_INSTITUTION_TOKEN
 MCP Client 协议验证：
 
 ```bash
-.venv/bin/python -B examples/test_mcp_client.py
-.venv/bin/python -B examples/test_mcp_client_http.py
-.venv/bin/python -B examples/test_mcp_client_web.py
+uv run python -B examples/test_mcp_client.py
+uv run python -B examples/test_mcp_client_http.py
+uv run python -B examples/test_mcp_client_web.py
 ```
 
-## 环境（全部在项目内）
+## 环境（由 uv 统一管理）
 
 ```bash
-# 虚拟环境位于项目内 .venv/，系统 Python 零污染
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+# 第一次使用：uv 会创建项目内 .venv/ 并依据 uv.lock 同步依赖
+uv sync
+
+# 打包桌面版时再安装 PyInstaller 构建组
+uv sync --group build
 ```
 
 ## 快速开始
 
 ```bash
 # 方式一：命令行
-.venv/bin/python -B -m agent.cli "transformer"                    # 检索 + 报告
-.venv/bin/python -B -m agent.cli "下载关于llm的论文" --max-downloads 3  # 检索 + 下载
-.venv/bin/python -B -m agent.cli "llm agent" --summarize          # 检索 + LLM 智能摘要
-.venv/bin/python -B -m agent.cli "mamba" --summarize --analyze    # 摘要 + 跨文献分析
-.venv/bin/python -B -m agent.cli "mamba" --summarize --summarize-limit 3  # 最多摘要 3 篇
+uv run python -B -m agent.cli "transformer"                    # 检索 + 报告
+uv run python -B -m agent.cli "下载关于llm的论文" --max-downloads 3  # 检索 + 下载
+uv run python -B -m agent.cli "llm agent" --summarize          # 检索 + LLM 智能摘要
+uv run python -B -m agent.cli "mamba" --summarize --analyze    # 摘要 + 跨文献分析
+uv run python -B -m agent.cli "mamba" --summarize --summarize-limit 3  # 最多摘要 3 篇
 
 # 方式二：Python API
-.venv/bin/python -B examples/demo_search.py "mamba state space model" 5
+uv run python -B examples/demo_search.py "mamba state space model" 5
 ```
 
-## Web 界面（v0.0.4）
+
+## Web 界面（v0.1.0）
 
 纯标准库实现的浏览器界面（零新依赖）：
 
 ```bash
-.venv/bin/python -B -m agent.webapp --port 8765
+uv run python -B -m agent.webapp --port 8765
 # 浏览器打开 http://127.0.0.1:8765
 ```
 
-功能：提交单轮、深度闭环与多主题对比研究，管理任务、计划、报告、文献、记忆和成本，
-并在 Web 中直接配置 Ollama / DeepSeek、运行标准 Skill，以及管理 Paper Studio 作为 MCP Server 和
+功能：提交单轮、深度闭环与多主题对比研究，管理任务、计划、报告、文献和记忆，
+并在 Web 中管理多家模型服务、运行标准 Skill，以及管理 Paper Studio 作为 MCP Server 和
 MCP Client 的双重能力。任务在后台线程执行，页面自动同步运行状态。
 
 应用内还提供以下工作台能力：
 
-- **模型配置**：填写 Ollama / DeepSeek 服务地址；点击「读取 Ollama 模型」发现本机已安装模型，或手动输入任意已部署模型名称。
+- **模型服务中心**：内置 Ollama、DeepSeek、OpenAI、OpenRouter、硅基流动、智谱、阿里百炼、火山方舟和 OneAPI，可添加任意 OpenAI 兼容服务；每个档案独立管理地址、模型列表、默认模型、Key 环境变量和凭据状态。
+- **现代应用体验**：首次载入提供 Web/App 共用的品牌启动动画；导航可折叠，报告、文献与记忆工作区使用独立滚动区域，菜单、筛选、空状态和浅色/暗色配色均按桌面应用交互统一。
 - **研究参数**：手动研究、多主题对比与定时计划均可设置来源、起始年份、摘要上限、引用分析和公开 PDF 下载策略。
 - **多主题对比**：在独立的「对比研究」页面中一次输入 2–6 个主题，任务进入统一队列，生成可管理的对比报告。
-- **任务控制**：运行中的研究可暂停、继续或取消。暂停与取消在当前网络请求、下载或单篇摘要结束后的安全检查点生效，避免损坏资料与报告。
-- **任务进度与中文日志**：任务中心展示规划、检索、下载、摘要、分析、引用和报告阶段，同时显示进度条与耗时。日志管道强制 UTF-8，自动合并 `print()` 分片、移除 ANSI 控制码并还原 `\uXXXX` 中文转义。
-- **任务检索与筛选**：可按主题或任务编号搜索，按执行中、已完成、失败和已取消筛选，并可一键复制完整日志。
+- **任务控制与恢复**：运行中的研究可暂停、继续或取消。暂停与取消在当前网络请求、下载或单篇摘要结束后的安全检查点生效；应用关闭后的活动任务自动变为“待恢复”，用户可从上次安全检查点继续。
+- **完整执行轨迹**：任务中心会保存并展示研究输入、检索计划与结果、模型输入/输出、模型重试、服务商切换、失败原因、报告生成及检查点；日志管道强制 UTF-8，自动合并 `print()` 分片、移除 ANSI 控制码并还原 `\uXXXX` 中文转义。
+- **人工介入**：暂停或待恢复的任务可修改研究查询、逐篇排除论文、补充检索方向后继续；修改查询或排除论文会清晰地重置旧检查点，避免混合旧问题或已排除论文的证据。
+- **任务检索与筛选**：可按主题或任务编号搜索，按执行中、待恢复、已完成、失败和已取消筛选，并可一键复制完整日志。
 - **队列管理**：已完成、已取消和失败的任务可单独删除或一键清空；不会删除关联报告。
 - **定时任务**：在「定时」页创建、启用、停用、立即执行或删除自动研究计划；计划会完整保留检索范围、引用和下载参数。
-- **报告阅读与管理**：在「报告」页查看历史 Markdown 报告、不必离开应用；可在系统文件管理器中显示原文件，或删除应用下载目录内的报告。
-- **本地文献库**：按下载批次查看、搜索和筛选 PDF；可直接打开、在文件夹中定位、删除单篇本地文件或整批资料。删除单篇时保留元数据和「已删除」状态，方便溯源。
-- **记忆管理**：在「记忆」页搜索历史查询或论文标题、查看保存的论文与研究盲点，并可删除单条或清空全部记忆；删除后同一主题将重新检索。
+- **报告阅读与管理**：在「报告」页查看历史 Markdown 报告、不必离开应用；提供目录导航、已下载文献跳转、版本快照/恢复和 Markdown、Word、PDF 离线导出，也可在系统文件管理器中显示原文件或删除应用下载目录内的报告。
+- **本地文献库**：按下载批次查看、搜索、筛选和质量评分排序 PDF；内置阅读工作台可预览 PDF、在抽取文本中高亮、批注、摘录、打标签和定位引用。可勾选已有文献继续研究而不重新检索；删除单篇时保留元数据和「已删除」状态，方便溯源。
+- **语义记忆与知识图谱**：在「记忆」页离线语义搜索历史研究、论文、方法、结论与盲点，并查看主题—论文—作者—方法—结论—盲点关系图；支持固定、归档、合并、设置有效期、安全清理及 Markdown / JSON 导出。新研究会自动复用相关历史结论，并在任务轨迹与报告中明确列出复用来源，同时继续用新文献交叉验证。
 - **Skill 能力中心**：查看全部核心 Skill 的 Schema、权限和默认超时，以统一 `SkillResult` 执行并展示进度；网络、写入、付费或删除操作需要用户确认。
 - **MCP 双角色**：设置页提供 MCP Server 状态和宿主配置；MCP Client 可发现 Tools、Resources、Resource Templates 和 Prompts，并按连接权限安全调用。
 
@@ -263,33 +307,24 @@ MCP Client 的双重能力。任务在后台线程执行，页面自动同步运
 
 - Web / 桌面端每来源默认检索 10 条，可设置 1–50；下载数量默认 10，可设置 1–50，不再固定为 5 篇。
 - 深度研究先合并所有轮次并全局去重，之后只执行一次批量下载；`max_downloads` 是整个任务的上限，不会在每个派生查询中重复计算。
-- 下载器按主机名全局限速（默认间隔 2 秒），对 HTTP 429 和临时服务错误指数退避重试。「模型与费用设置」可调整下载间隔、重试次数和超时。
+- 下载器按主机名全局限速（默认间隔 2 秒），对 HTTP 429 和临时服务错误指数退避重试。「设置 → 运行与下载」可调整下载间隔、重试次数和超时。
 - 每篇处理后原子更新 `metadata.json`，单篇失败不会中断整批；临时文件使用 `.part` 后缀，验证 PDF 签名成功后才替换正式文件。
 - 遵循 `agent/skills/SKILL.md` 的可获取性和版权合规原则：只下载明确的公开 PDF 地址。只有 DOI/出版社页面时保留元数据并标记「无公开 PDF」，不会把 HTML 错当成 PDF。
 
-### Ollama / DeepSeek 双模式与预算保护
+### 多模型服务商
 
-- **自动模式（默认）**：优先使用已启动的 Ollama；不可用时才使用已配置的 DeepSeek。
+- **智能选择（默认）**：优先使用已启动的 Ollama；不可用时选择首个配置完整的云端服务商。
 - **Ollama**：本地推理，不产生 API token 费用。先执行 `ollama serve`，再拉取模型，例如 `ollama pull gemma4:e4b`。
-- **DeepSeek**：桌面版输入 Key 后会使用操作系统的加密安全存储保存，并在下次启动时自动加载；Key 不会回显或写入报告。浏览器模式仍仅在当前进程保留，也可通过 `.env` 配置 `LLM_API_KEY`。
-- **预算**：设置会话 CNY 上限后，每次 DeepSeek 请求均按「缓存未命中输入 + 最大输出」的保守价格预检；预计越界即拒绝请求。实际 token 消耗会在「成本」页记录。
-- **成本工作台**：成本页按云端 / 本地调用拆分，展示预算进度、剩余额度、80% 预警与拦截记录；调用明细可按服务商、用途或模型筛选。清空仅重置本次应用会话的统计，不影响实际云端账单。
-- **请求超时**：在模型设置中调整单次模型请求的超时秒数（10–600，默认 90）。本地模型可按设备性能设为 180–300 秒，网络不稳定的云端服务也可适当增加。
+- **云端与兼容服务**：内置 DeepSeek、OpenAI、OpenRouter、硅基流动、智谱、阿里百炼和火山方舟连接模板，并提供 OneAPI 自部署网关模板；也可连接机构网关、私有部署或其他 OpenAI Chat Completions 兼容 API。
+- **自定义模型**：模型名称始终允许手动录入，也可通过兼容服务的 `GET /models` 自动发现。
+- **真实可用性检测**：可在保存前使用当前 Base URL、模型与新输入的 Key 测试草稿；测试会向所选模型发出一次不流式、最多 1 个输出 token 的请求，验证地址、凭据、权限和模型推理能力。不会把“已填 Key”误显示为“模型可用”，临时 Key 也不会写入设置文件。
+- **自动重试与切换**：HTTP 429、超时、连接错误和 5xx 会采用短暂指数退避重试；仍失败时仅在已配置、可用的 OpenAI 兼容云服务商之间切换，并在任务轨迹中保留原因与目标模型。
+- **模型配置文件**：设置 → 模型配置可查看、刷新和复制 `model_config.json`。该文件可安全备份服务商、模型、路由和超时配置；其中只保存凭据引用和管理策略，绝不保存 API Key 明文。
+- **持久化凭据**：桌面版会为每个服务商使用操作系统加密安全存储，并在每次启动时自动恢复，无需重复填写。Key 不回显、不写入报告，也不会写入 `model_config.json`。独立 Web 服务如需跨重启持久化，应使用服务商对应的环境变量。
+- **请求超时**：在设置中调整单次模型请求的超时秒数（10–1800，默认 90）。本地模型可按设备性能延长，网络不稳定的云端服务也可适当增加。
+- **成本页面**：v0.1.0 已移除成本页面及其所有界面功能；云端服务产生的费用请在对应服务商控制台查看。
 
-当前 Web 内置的 DeepSeek 官方价格（人民币 / 每 1M tokens）仅包含 Flash 和 Pro：
-
-| 模型 | 时段 | 输入（缓存未命中） | 输入（缓存命中） | 输出 |
-| --- | --- | ---: | ---: | ---: |
-| `deepseek-v4-flash` | 高峰 | ¥3.00 | ¥0.10 | ¥9.00 |
-| `deepseek-v4-flash` | 空闲 | ¥1.50 | ¥0.05 | ¥4.50 |
-| `deepseek-v4-pro` | 高峰 | ¥9.00 | ¥0.30 | ¥27.00 |
-| `deepseek-v4-pro` | 空闲 | ¥4.50 | ¥0.15 | ¥13.50 |
-
-高峰时段为北京时间 09:00–12:00、14:00–18:00，其余时间按空闲价格。
-
-价格会调整，使用前请以 [DeepSeek 官方定价页](https://api-docs.deepseek.com/zh-cn/quick_start/pricing) 为准。
-
-## Electron 桌面应用（v0.0.4）
+## Electron 桌面应用（v0.1.0）
 
 桌面版在本机启动 Python 后端，不会将论文或 API Key 发送给 Electron 之外的服务；
 报告、下载内容和研究记忆保存到操作系统的应用数据目录。
@@ -307,4 +342,6 @@ cd desktop
 npm run dist
 ```
 
-构建前需要在项目根目录准备 `.venv` 并安装 `requirements-build.txt`。`npm run dist` 会自动识别宿主系统并先生成不依赖目标电脑 Python 环境的自包含后端：Apple Silicon Mac 输出 arm64 的 DMG/ZIP，Windows x64 输出 NSIS 安装程序/ZIP。每个目标平台必须在对应原生系统构建，详见 [desktop/README.md](desktop/README.md)。
+桌面构建由 `uv run --group build` 自动同步 Python 环境并运行 PyInstaller，不再依赖手动准备的 `.venv`。`npm run dist` 会自动识别宿主系统并先生成不依赖目标电脑 Python 环境的自包含后端：Apple Silicon Mac 输出 arm64 的 DMG/ZIP，Windows x64 输出 NSIS 安装程序/ZIP。每个目标平台必须在对应原生系统构建，详见 [desktop/README.md](desktop/README.md)。
+
+macOS 应用壳使用 `desktop/assets/icon.icns`，Windows 使用 `desktop/assets/icon.png`；Web 页面、启动动画和应用内部关于页继续使用 `agent/static/assets/paper-studio-logo.png`。发布包只包含程序与静态资源，不包含 `.env`、API Key、模型配置、报告、PDF、记忆、任务或定时计划。当前 macOS 构建未配置 Apple Developer ID 签名与公证，首次启动可能需要右键选择“打开”。
