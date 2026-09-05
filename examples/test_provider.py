@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import agent.core.llm as llm_mod
 from agent.core import CostTracker
-from agent.core.llm import LLMClient
+from agent.core.llm import LLMClient, LLMError
 
 
 def expect(name, cond):
@@ -29,7 +29,7 @@ def main() -> None:
     expect("默认模型", c.model  # 允许默认或配置值
            in ("gemma4:e4b", llm_mod.config.get("OLLAMA_MODEL")))
     st = c.status()
-    expect("状态含零成本说明", "零成本" in st["reason"])
+    expect("状态含本地零 API 成本说明", "零 API 成本" in st["reason"])
 
     print("== 用例 2：强制 DeepSeek ==")
     c = LLMClient(provider="deepseek", api_key="sk-test")
@@ -137,6 +137,100 @@ def main() -> None:
         expect("含大小", abs(models[0]["size_gb"] - 4.7) < 0.1)
     finally:
         requests.get = orig_get
+
+    print("== 用例 8：自定义 OpenAI 服务商不读 .env 的 Key ==")
+    # 模拟 Web 自定义 profile（如 DashScope）：api_key_env 为空时，即便 .env
+    # 配了 DeepSeek 的 LLM_API_KEY，也不应误用到该 profile 上（避免 401）。
+    custom = LLMClient(provider="custom-xyz", provider_type="openai",
+                       provider_name="自定义", requires_api_key=True,
+                       model="qwen3-max", api_key="")
+    expect("api_key 不读 .env", custom.api_key == "")
+    expect("无 Key 不可用", custom.available is False)
+    expect("状态提示未配置", "未配置" in custom.status()["reason"])
+    custom2 = LLMClient(provider="custom-xyz", provider_type="openai",
+                        requires_api_key=True, model="qwen3-max",
+                        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                        api_key="sk-real")
+    expect("填 Key 后可用", custom2.available is True)
+    expect("endpoint 正确",
+           custom2._endpoint
+           == "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+
+    print("== 用例 9：云端自动重试、故障切换与真实探测 ==")
+    trace = []
+    primary = LLMClient(provider="primary", provider_type="openai",
+                        model="primary-model", base_url="https://primary.example/v1",
+                        api_key="sk-primary", event_callback=trace.append)
+    backup = LLMClient(provider="backup", provider_type="openai",
+                       model="backup-model", base_url="https://backup.example/v1",
+                       api_key="sk-backup", event_callback=trace.append)
+    primary._post = lambda payload: (_ for _ in ()).throw(
+        LLMError("LLM 请求失败: HTTP 503 temporary"))
+    backup._post = lambda payload: {
+        "choices": [{"message": {"content": "fallback ok"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    primary.set_failovers([backup])
+    expect("503 后自动切换备用服务商",
+           primary.chat("hi", purpose="故障切换") == "fallback ok")
+    expect("轨迹记录故障切换", any(item["kind"] == "failover"
+                                 for item in trace))
+
+    import requests
+    original_post, original_get = requests.post, requests.get
+    post_calls = []
+
+    class FakeResponse:
+        def __init__(self, status, data=None, text=""):
+            self.status_code = status
+            self._data = data or {}
+            self.text = text
+
+        def json(self):
+            return self._data
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise requests.HTTPError(f"HTTP {self.status_code}")
+
+    try:
+        responses = iter([
+            FakeResponse(503, text="busy"),
+            FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]}),
+        ])
+        requests.post = lambda *args, **kwargs: (post_calls.append(kwargs) or
+                                                  next(responses))
+        original_sleep = llm_mod.time.sleep
+        llm_mod.time.sleep = lambda _: None
+        retry_client = LLMClient(
+            provider="retry", provider_type="openai", model="retry-model",
+            base_url="https://retry.example/v1", api_key="sk-retry",
+            event_callback=trace.append)
+        expect("503 请求在同一服务商自动重试",
+               retry_client._post({"model": "retry-model", "messages": []})[
+                   "choices"][0]["message"]["content"] == "ok" and
+               len(post_calls) == 2)
+        expect("轨迹记录重试", any(item["kind"] == "retry" for item in trace))
+
+        probe_calls = []
+        requests.post = lambda *args, **kwargs: (
+            probe_calls.append((args, kwargs)) or FakeResponse(
+                200, {"choices": [{"message": {"content": "OK"}}]}))
+        probe = retry_client.probe(verify_model=True)
+        expect("显式真实探测返回验证状态",
+               probe["checked"] is True and probe["verified"] is True and
+               probe["stages"][-1]["id"] == "model")
+        expect("探测真实调用当前模型且最多 1 token",
+               probe_calls[0][1]["json"]["model"] == "retry-model" and
+               probe_calls[0][1]["json"]["max_tokens"] == 1)
+
+        requests.post = lambda *args, **kwargs: FakeResponse(401)
+        denied = retry_client.probe(verify_model=True)
+        expect("真实探测返回可诊断的凭据错误",
+               denied["verified"] is False and "API Key" in denied["reason"])
+    finally:
+        requests.post, requests.get = original_post, original_get
+        llm_mod.time.sleep = original_sleep
 
     print("\n全部用例通过 ✅")
 

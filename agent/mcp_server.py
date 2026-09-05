@@ -1,6 +1,6 @@
 """Paper Studio MCP Server（stdio）。
 
-启动：``python -B -m agent.mcp_server``
+启动：``uv run python -B -m agent.mcp_server``
 
 只读能力可直接调用；启动、下载、删除、记忆写入和定时任务通过
 MCP Elicitation 请求用户明确确认，拒绝、取消或客户端不支持时默认失败。

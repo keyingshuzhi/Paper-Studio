@@ -9,5 +9,7 @@ contextBridge.exposeInMainWorld("agent", {
   openLibraryFile: (filePath) => ipcRenderer.invoke("library:open", filePath),
   loadDeepSeekKey: () => ipcRenderer.invoke("secret:load"),
   saveDeepSeekKey: (value) => ipcRenderer.invoke("secret:save", value),
+  loadProviderSecrets: () => ipcRenderer.invoke("secrets:load"),
+  saveProviderSecrets: (value) => ipcRenderer.invoke("secrets:save", value),
   appInfo: () => ipcRenderer.invoke("app:info"),
 });

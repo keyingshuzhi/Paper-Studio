@@ -1,0 +1,20 @@
+[project]
+name = "paper-studio"
+version = "0.1.0"
+description = "Local-first AI research workspace for literature discovery and deep research"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "mcp[cli]>=2.0.0,<3.0.0",
+    "pypdf>=4.0.0",
+    "reportlab>=4.0.0,<5.0.0",
+    "requests>=2.31.0",
+]
+
+[dependency-groups]
+build = [
+    "pyinstaller>=6.22,<7",
+]
+
+[tool.uv]
+package = false

@@ -161,6 +161,14 @@ class BaseSkill(ABC):
     name: ClassVar[str] = "base"
     description: ClassVar[str] = ""
     version: ClassVar[str] = "1.0.0"
+    # Skill 可视化元数据：tags 用于在 UI 中按角色/类别过滤；examples 给
+    # 用户直观看到一次典型调用长什么样；enabled 由用户在「技能中心」可
+    # 临时关闭（仅会话级，跨进程不持久化）。Skill 之间允许存在依赖关系，
+    # 例如 library_rag 依赖 downloader，UI 会把禁用导致级联禁用的技能
+    # 标红并附 reason。
+    tags: ClassVar[Tuple[str, ...]] = ()
+    examples: ClassVar[Tuple[Dict[str, Any], ...]] = ()
+    enabled: ClassVar[bool] = True
     input_schema: ClassVar[JsonSchema] = {
         "type": "object",
         "additionalProperties": True,
@@ -368,6 +376,9 @@ class BaseSkill(ABC):
             "name": cls.name,
             "description": cls.description,
             "version": cls.version,
+            "tags": list(cls.tags),
+            "examples": list(cls.examples),
+            "enabled": bool(cls.enabled),
             "input_schema": _to_jsonable(cls.input_schema),
             "output_schema": _to_jsonable(cls.output_schema),
             "permissions": sorted(p.value for p in cls.permissions),

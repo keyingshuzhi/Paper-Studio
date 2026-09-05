@@ -1,19 +1,19 @@
-"""Paper Studio v0.0.4 Web 界面与 Electron 共用后端。
+"""Paper Studio v0.1.0 Web interface and Electron shared backend.
 
 功能：
-- 双模式 LLM：Ollama（本地零成本）/ DeepSeek（云端按量）自动切换 + 手动选择
-- 成本控制：预算设置、实时成本追踪、超限自动拦截、费用预测、趋势图
+- 多服务商 LLM：内置常用预设，并支持任意 OpenAI 兼容服务商与模型
 - 任务中心：中文阶段、结构化进度、耗时、可搜索日志；研究记忆统计
 - 兼容 Electron 桌面封装（window.agent.openPath 打开报告所在文件夹）
 - 现代 UI：暗色主题、响应式布局、渐变动画
 
 启动：
-    .venv/bin/python -B -m agent.webapp --port 8765
+    uv run python -B -m agent.webapp --port 8765
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -31,14 +31,18 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .core import CostTracker, LLMClient, PaperSummarizer
+from .core import (CostTracker, LLMClient, PaperSummarizer,
+                   default_provider_profiles, persistent_profiles,
+                   profile_by_id, sanitize_provider_profiles,
+                   get as config_get)
 from .core.memory import ResearchMemory
 from .mcp_client import (MCPClientError, MCPClientManager,
                          MCPPermissionBroker, run_async)
 from .read_service import resolve_data_dir
+from .report_export import export_docx, export_name, export_pdf
 
 
-APP_VERSION = "0.0.4"
+APP_VERSION = "0.1.0"
 _RESEARCH_SOURCES = frozenset({"arxiv_search", "scholar_search"})
 _SKILL_CONFIRM_PERMISSIONS = frozenset({
     "network", "filesystem.write", "paid_api", "external.write", "destructive",
@@ -434,10 +438,14 @@ class _LogBuffer:
         r"\x1B(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
     _UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
 
-    def __init__(self) -> None:
+    def __init__(self, on_line: Optional[Callable[[str], None]] = None) -> None:
         self.lines: List[str] = []
         self._pending = ""
-        self.lock = threading.Lock()
+        # Log/event callbacks can run while a state transition holds the
+        # queue lock; reentrancy keeps durable logging from deadlocking the
+        # worker at exactly the point a task is paused or recovered.
+        self.lock = threading.RLock()
+        self._on_line = on_line
 
     def write(self, text: str) -> int:
         """支持多次碎片写入、ANSI 清理与 UTF-8 容错。"""
@@ -447,13 +455,22 @@ class _LogBuffer:
             text = str(text)
         length = len(text)
         text = text.replace("\r\n", "\n").replace("\r", "\n")
+        appended: List[str] = []
         with self.lock:
             chunks = (self._pending + text).split("\n")
             self._pending = chunks.pop()
             for chunk in chunks:
-                self._append_line(chunk)
+                line = self._append_line(chunk)
+                if line is not None:
+                    appended.append(line)
             if len(self.lines) > 2000:
                 del self.lines[:1000]
+        for line in appended:
+            if self._on_line is not None:
+                try:
+                    self._on_line(line)
+                except Exception:
+                    pass
         return length
 
     @classmethod
@@ -468,17 +485,25 @@ class _LogBuffer:
                        if ch in "\t" or ord(ch) >= 32)
         return unicodedata.normalize("NFC", text).rstrip()
 
-    def _append_line(self, text: str) -> None:
+    def _append_line(self, text: str) -> Optional[str]:
         line = self._clean(text)
         # 保留一个空行分隔阶段，避免进度日志被无限拉长。
         if line or not self.lines or self.lines[-1] != "":
             self.lines.append(line)
+            return line
+        return None
 
     def flush(self) -> None:
+        appended: Optional[str] = None
         with self.lock:
             if self._pending:
-                self._append_line(self._pending)
+                appended = self._append_line(self._pending)
                 self._pending = ""
+        if appended is not None and self._on_line is not None:
+            try:
+                self._on_line(appended)
+            except Exception:
+                pass
 
     def tail(self, n: int = 200) -> List[str]:
         with self.lock:
@@ -524,12 +549,17 @@ class JobCancelled(RuntimeError):
     """研究在安全检查点被用户取消。"""
 
 
+class JobRestartRequested(RuntimeError):
+    """用户在暂停期间修改了研究范围，需要从安全检查点重新调度。"""
+
+
 class _JobControl:
     """协作式暂停/取消控制器，不强杀正在执行的网络或文件操作。"""
 
     def __init__(self) -> None:
         self.paused = False
         self.cancelled = False
+        self.restart_requested = False
         self._condition = threading.Condition()
 
     def checkpoint(self) -> None:
@@ -538,6 +568,8 @@ class _JobControl:
                 self._condition.wait(timeout=0.5)
             if self.cancelled:
                 raise JobCancelled("研究已由用户取消")
+            if self.restart_requested:
+                raise JobRestartRequested("已应用人工调整，将从安全检查点继续")
 
     def pause(self) -> None:
         with self._condition:
@@ -554,18 +586,33 @@ class _JobControl:
             self.paused = False
             self._condition.notify_all()
 
+    def restart(self) -> None:
+        with self._condition:
+            self.restart_requested = True
+            self._condition.notify_all()
+
 
 class ResearchWebApp:
-    """研究任务 Web 服务（双模式 LLM + 成本控制）。"""
+    """Paper Studio research service with configurable model providers."""
 
     def __init__(self, runner: Optional[Callable] = None,
                  memory: Optional[ResearchMemory] = None,
-                 schedule_path: Optional[str] = None) -> None:
+                 schedule_path: Optional[str] = None,
+                 jobs_path: Optional[str] = None) -> None:
         self.data_dir = resolve_data_dir()
+        self.annotations_path = self.data_dir / "library_annotations.json"
+        self.report_versions_path = self.data_dir / "report_versions.json"
+        self.report_versions_dir = self.data_dir / "report_versions"
+        self.exports_dir = self.data_dir / "exports"
         self.memory = memory or ResearchMemory(
             path=str(self.data_dir / "research_memory.json"))
         self.jobs: Dict[str, Dict[str, Any]] = {}
-        self.lock = threading.Lock()
+        # Durable log callbacks can re-enter the queue state transition that
+        # emitted them, so this must be re-entrant rather than a plain Lock.
+        self.lock = threading.RLock()
+        self.jobs_path = (Path(jobs_path) if jobs_path else
+                          self.data_dir / "research_jobs.json")
+        self._load_jobs()
         # MCP 控制接口使用每次进程启动都不同的凭据，仅写入应用数据目录。
         self._mcp_control_token = secrets.token_urlsafe(32)
         self._mcp_runtime_path = self.data_dir / "mcp_runtime.json"
@@ -573,26 +620,47 @@ class ResearchWebApp:
         # Client 连接文献管理、知识库、文件系统和机构数据库。
         self.mcp_clients = MCPClientManager()
         self.mcp_permissions = MCPPermissionBroker()
-        #: 全局设置（provider / model / budget），可被 /api/settings 修改
+        #: Provider profiles contain no secrets.  Credential values are kept
+        #: separately and, in desktop builds, restored from Electron
+        #: safeStorage.  The source map is metadata only: it never contains a
+        #: secret and lets the UI distinguish persistent secure storage from a
+        #: browser-session key.
         self.settings: Dict[str, Any] = {
             "provider": "auto",
             "model": "gemma4:e4b",
-            "budget_cny": None,
+            "provider_profiles": default_provider_profiles(),
+            "provider_api_keys": {},
+            "provider_key_sources": {},
             "llm_timeout": 90,
             "download_interval": 2.0,
             "download_retries": 4,
             "download_timeout": 90,
+            # Legacy fields remain readable during migration only.
             "ollama_base_url": "http://localhost:11434",
             "deepseek_base_url": "https://api.deepseek.com",
-            # 仅保存在进程内，不写入 .env、报告或 API 响应。
             "api_key": None,
         }
-        self.settings_path = self.data_dir / "app_settings.json"
+        # ``model_config.json`` is the user-facing, readable configuration
+        # file.  API Key values are deliberately absent from it; desktop
+        # credentials live in the OS-encrypted provider-secrets.bin vault.
+        self.config_dir = Path(
+            os.environ.get("PAPER_STUDIO_CONFIG_DIR") or self.data_dir
+        ).expanduser().resolve()
+        self.settings_path = self.config_dir / "model_config.json"
+        # Earlier releases put app_settings.json beside downloaded research
+        # files.  Keep both migration candidates so desktop updates retain
+        # their existing model profiles regardless of the old layout.
+        self.legacy_settings_paths = [
+            self.config_dir / "app_settings.json",
+            self.data_dir / "app_settings.json",
+        ]
         self._load_settings()
+        if not self.settings_path.exists():
+            self._save_settings()
         #: 持久化成本追踪（共享给所有任务，也供只读 MCP 读取）
         self.tracker = CostTracker(
             storage_path=self.data_dir / "cost_ledger.json")
-        self.tracker.set_budget(self.settings.get("budget_cny"))
+        self.tracker.set_budget(None)
         self.schedule_path = (Path(schedule_path) if schedule_path else
                               self.data_dir / "app_schedules.json")
         self.schedules: Dict[str, Dict[str, Any]] = {}
@@ -602,6 +670,204 @@ class ResearchWebApp:
             target=self._schedule_daemon, daemon=True)
         self._schedule_thread.start()
         self.runner = runner or self._default_runner
+
+    # ------------------------------------------------------------------
+    # Durable research queue
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _safe_trace_value(value: Any, *, depth: int = 0) -> Any:
+        """Keep persisted traces useful, bounded and free from credential keys."""
+        if depth > 5:
+            return "[已截断]"
+        if isinstance(value, str):
+            return value[:24000] + ("…[已截断]" if len(value) > 24000 else "")
+        if isinstance(value, (int, float, bool)) or value is None:
+            return value
+        if isinstance(value, (list, tuple)):
+            return [ResearchWebApp._safe_trace_value(item, depth=depth + 1)
+                    for item in value[:100]]
+        if isinstance(value, dict):
+            clean: Dict[str, Any] = {}
+            for key, item in list(value.items())[:120]:
+                label = str(key)
+                if any(token in label.casefold() for token in (
+                        "api_key", "apikey", "authorization", "secret", "token")):
+                    clean[label] = "[已隐藏]"
+                else:
+                    clean[label] = ResearchWebApp._safe_trace_value(
+                        item, depth=depth + 1)
+            return clean
+        return str(value)[:2000]
+
+    @staticmethod
+    def _job_options_view(options: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {
+            "mode", "max_results", "rounds", "branching", "max_queries",
+            "provider", "model", "download", "max_downloads", "sources",
+            "year_from", "summarize_limit", "analyze_citations", "topics",
+            "download_interval", "library_selection",
+        }
+        return {key: ResearchWebApp._safe_trace_value(value)
+                for key, value in options.items() if key in allowed}
+
+    def _new_log(self, job_id: str, lines: Optional[List[str]] = None) -> _LogBuffer:
+        log = _LogBuffer(on_line=lambda line: self._on_job_log(job_id, line))
+        for line in lines or []:
+            log.write(str(line) + "\n")
+        return log
+
+    def _serialize_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        """Serialize a research record, intentionally excluding live controls."""
+        return {
+            "id": job["id"], "query": job.get("query", ""),
+            "mode": job.get("mode", "single"),
+            "download": bool(job.get("download")),
+            "max_results": job.get("max_results"),
+            "topics": list(job.get("topics") or []),
+            "desc": job.get("desc", ""), "status": job.get("status", "queued"),
+            "log": job["log"].tail(2000),
+            "error": job.get("error"),
+            "created_at": job.get("created_at"),
+            "created_ts": job.get("created_ts"),
+            "started_at": job.get("started_at"),
+            "started_ts": job.get("started_ts"),
+            "finished_at": job.get("finished_at"),
+            "finished_ts": job.get("finished_ts"),
+            "report_path": job.get("report_path"),
+            "options": self._job_options_view(job.get("options") or {}),
+            "intervention": self._safe_trace_value(job.get("intervention") or {}),
+            "intervention_history": self._safe_trace_value(
+                job.get("intervention_history") or []),
+            "checkpoint": self._safe_trace_value(job.get("checkpoint")),
+            "events": self._safe_trace_value((job.get("events") or [])[-300:]),
+            "resume_count": int(job.get("resume_count") or 0),
+        }
+
+    def _save_jobs_locked(self) -> None:
+        """Atomically save every resumable task while holding ``self.lock``."""
+        self.jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"version": 1, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "jobs": [self._serialize_job(job) for job in self.jobs.values()]}
+        tmp = self.jobs_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        tmp.replace(self.jobs_path)
+
+    def _load_jobs(self) -> None:
+        """Restore task records; running work becomes an explicit recovery task.
+
+        There is no safe way to resurrect an interrupted Python thread or an
+        in-flight paid request after a process exits.  The last durable
+        orchestration checkpoint and all trace data are restored and the user
+        can resume from that safe boundary with one click.
+        """
+        if not self.jobs_path.exists():
+            return
+        try:
+            raw = json.loads(self.jobs_path.read_text(encoding="utf-8"))
+            entries = raw.get("jobs", []) if isinstance(raw, dict) else []
+            if not isinstance(entries, list):
+                return
+            for saved in entries[:500]:
+                if not isinstance(saved, dict):
+                    continue
+                job_id = str(saved.get("id") or "").strip()
+                query = str(saved.get("query") or "").strip()
+                if not job_id or not query:
+                    continue
+                status = str(saved.get("status") or "queued")
+                was_active = status in {"queued", "running", "paused", "cancelling", "restarting"}
+                if was_active:
+                    status = "interrupted"
+                logs = [str(line) for line in saved.get("log") or []]
+                if was_active:
+                    logs.append("[恢复] 应用在任务执行中关闭；已保存最后安全检查点。可在任务中心修改范围后继续。")
+                options = saved.get("options") if isinstance(saved.get("options"), dict) else {}
+                job = {
+                    "id": job_id, "query": query,
+                    "mode": str(saved.get("mode") or options.get("mode") or "single"),
+                    "download": bool(saved.get("download")),
+                    "max_results": saved.get("max_results"),
+                    "topics": list(saved.get("topics") or []),
+                    "desc": str(saved.get("desc") or query), "status": status,
+                    "result": None, "error": saved.get("error"),
+                    "created_at": saved.get("created_at"),
+                    "created_ts": float(saved.get("created_ts") or time.time()),
+                    "started_at": saved.get("started_at"),
+                    "started_ts": saved.get("started_ts"),
+                    "finished_at": saved.get("finished_at"),
+                    "finished_ts": saved.get("finished_ts"),
+                    "report_path": saved.get("report_path"),
+                    "options": self._job_options_view(options),
+                    "intervention": (saved.get("intervention") if isinstance(
+                        saved.get("intervention"), dict) else {}),
+                    "intervention_history": list(saved.get("intervention_history") or []),
+                    "checkpoint": (saved.get("checkpoint") if isinstance(
+                        saved.get("checkpoint"), dict) else None),
+                    "events": list(saved.get("events") or [])[-300:],
+                    "resume_count": int(saved.get("resume_count") or 0),
+                    "control": _JobControl(),
+                }
+                job["log"] = self._new_log(job_id, logs)
+                self.jobs[job_id] = job
+            if self.jobs:
+                self._save_jobs_locked()
+        except (OSError, ValueError, TypeError):
+            # A partially written/old file must not stop the application.
+            self.jobs = {}
+
+    def _on_job_log(self, job_id: str, line: str) -> None:
+        with self.lock:
+            if job_id not in self.jobs:
+                return
+            self._append_event_locked(job_id, {
+                "kind": "log", "title": "过程日志", "detail": line,
+                "data": {},
+            }, persist=False)
+            self._save_jobs_locked()
+
+    def _append_event_locked(self, job_id: str, event: Dict[str, Any], *,
+                             persist: bool = True) -> None:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return
+        item = {
+            "id": uuid.uuid4().hex[:12],
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "kind": str(event.get("kind") or "event")[:80],
+            "title": str(event.get("title") or "执行事件")[:160],
+            "detail": str(event.get("detail") or "")[:4000],
+            "data": self._safe_trace_value(event.get("data") or {}),
+        }
+        events = job.setdefault("events", [])
+        events.append(item)
+        if len(events) > 300:
+            del events[:100]
+        if persist:
+            self._save_jobs_locked()
+
+    def _record_job_event(self, job_id: str, event: Dict[str, Any]) -> None:
+        with self.lock:
+            self._append_event_locked(job_id, event)
+
+    def _record_job_checkpoint(self, job_id: str, state: Dict[str, Any]) -> None:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return
+            job["checkpoint"] = self._safe_trace_value(state)
+            phase = str(state.get("phase") or "checkpoint")
+            self._append_event_locked(job_id, {
+                "kind": "checkpoint", "title": "可恢复检查点",
+                "detail": f"已保存 {phase} 阶段的安全检查点",
+                "data": {"phase": phase, "round_number": state.get("round_number"),
+                         "total_queries": state.get("total_queries")},
+            }, persist=False)
+            self._save_jobs_locked()
+
+    def _start_job_thread(self, job_id: str) -> None:
+        threading.Thread(target=self._work, args=(job_id,), daemon=True,
+                         name=f"paper-studio-{job_id[-8:]}").start()
 
     # ------------------------------------------------------------------
     def submit(self, query: str, mode: str = "deep",
@@ -615,14 +881,32 @@ class ResearchWebApp:
                year_from: Optional[int] = None,
                summarize_limit: Optional[int] = None,
                analyze_citations: bool = True,
-               topics: Optional[List[str]] = None) -> str:
+               topics: Optional[List[str]] = None,
+               library_selection: Optional[List[Dict[str, Any]]] = None) -> str:
         """提交任务，返回 job_id。"""
         with self.lock:
             job_id = self._new_job_id()
             while job_id in self.jobs:  # 极低概率碰撞保护
                 job_id = self._new_job_id()
             mode_label = ({"deep": "深度闭环", "single": "单轮",
-                           "compare": "多主题对比"}.get(mode, mode))
+                           "compare": "多主题对比",
+                           "library": "已有文献续研"}.get(mode, mode))
+            opts = {"mode": mode, "max_results": max_results,
+                    "rounds": rounds, "branching": branching,
+                    "max_queries": max_queries,
+                    "provider": provider, "model": model,
+                    "budget_cny": budget_cny,
+                    "download": bool(download),
+                    "max_downloads": max_downloads,
+                    "sources": list(sources) if sources else None,
+                    "year_from": year_from,
+                    "summarize_limit": summarize_limit,
+                    "analyze_citations": bool(analyze_citations),
+                    "topics": list(topics or []),
+                    "library_selection": self._safe_trace_value(
+                        list(library_selection or [])),
+                    "download_interval": float(
+                        self.settings.get("download_interval", 2.0))}
             self.jobs[job_id] = {
                 "id": job_id,
                 "query": query,
@@ -633,7 +917,7 @@ class ResearchWebApp:
                 "desc": (f"{query}（{mode_label}"
                          f"{' · 下载公开 PDF' if download else ''}）"),
                 "status": "queued",
-                "log": _LogBuffer(),
+                "log": self._new_log(job_id),
                 "result": None,
                 "error": None,
                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -644,25 +928,193 @@ class ResearchWebApp:
                 "finished_ts": None,
                 "report_path": None,
                 "control": _JobControl(),
+                "options": opts,
+                "intervention": {
+                    "research_direction": "", "exclude_titles": [],
+                },
+                "intervention_history": [],
+                "checkpoint": None,
+                "events": [],
+                "resume_count": 0,
             }
-        opts = {"mode": mode, "max_results": max_results,
-                "rounds": rounds, "branching": branching,
-                "max_queries": max_queries,
-                "provider": provider, "model": model,
-                "budget_cny": budget_cny,
-                "download": bool(download),
-                "max_downloads": max_downloads,
-                "sources": list(sources) if sources else None,
-                "year_from": year_from,
-                "summarize_limit": summarize_limit,
-                "analyze_citations": bool(analyze_citations),
-                "topics": list(topics or []),
-                "download_interval": float(
-                    self.settings.get("download_interval", 2.0))}
-        t = threading.Thread(target=self._work, args=(job_id, query, opts),
-                             daemon=True)
-        t.start()
+            self._append_event_locked(job_id, {
+                "kind": "submitted", "title": "研究任务已创建",
+                "detail": "任务已保存到本地恢复队列。",
+                "data": {"query": query, "options": self._job_options_view(opts)},
+            }, persist=False)
+            self._save_jobs_locked()
+        self._start_job_thread(job_id)
         return job_id
+
+    def submit_template(self, template_id: str, query: str,
+                        payload: Dict[str, Any]) -> str:
+        """通过研究模板 Skill 提交任务。
+
+        把表单字段映射到模板的 input_schema(综述/对比/开题/竞品/每日追踪),
+        复用既有 job 调度循环。模板不可用时退回通用模式并记录在 description。
+        """
+        from .skills import BaseSkill, SkillPermission
+        if not BaseSkill.has(template_id):
+            raise ValueError(f"未注册的研究模板: {template_id}")
+        from .skills.research_template_skill import (
+            ResearchTemplateCompareSkill, ResearchTemplateCompetitorSkill,
+            ResearchTemplateDailySkill, ResearchTemplateOpeningSkill,
+            ResearchTemplateSurveySkill,
+        )
+        allowed = {SkillPermission.FILESYSTEM_READ,
+                   SkillPermission.FILESYSTEM_WRITE,
+                   SkillPermission.NETWORK,
+                   SkillPermission.PAID_API}
+        builder_args = self._build_template_args(
+            template_id, query, payload)
+        # 描述写到任务卡片,便于用户在任务中心识别模板
+        desc_prefix = f"模板[{template_id.split('_')[-1]}]"
+        if template_id == "research_template_compare":
+            skill = ResearchTemplateCompareSkill()
+        elif template_id == "research_template_competitor":
+            skill = ResearchTemplateCompetitorSkill()
+        elif template_id == "research_template_daily":
+            skill = ResearchTemplateDailySkill()
+        elif template_id == "research_template_opening":
+            skill = ResearchTemplateOpeningSkill()
+        else:
+            skill = ResearchTemplateSurveySkill()
+        # 通过 invoke 校验参数,真正执行时仍走 ResearchAgent
+        preview = skill.invoke(allowed_permissions=allowed,
+                               progress_callback=lambda e: None, **builder_args)
+        if not preview.ok:
+            raise ValueError(preview.error.message
+                             if preview.error else "模板参数无效")
+        # 创建一个轻量 job,执行时调模板 Skill
+        job_id = self._new_job_id()
+        with self.lock:
+            self.jobs[job_id] = {
+                "id": job_id,
+                "query": query,
+                "desc": f"{desc_prefix} {query[:60]}",
+                "mode": "deep", "phase": "queued",
+                "status": "queued",
+                "events": [],
+                "logs": [],
+                "report_path": None,
+                "template": template_id,
+                "template_args": builder_args,
+            }
+            self._save_jobs_locked()
+        self._start_template_job(job_id, template_id, builder_args)
+        return job_id
+
+    def _start_template_job(self, job_id: str, template_id: str,
+                            builder_args: Dict[str, Any]) -> None:
+        """异步执行模板 Skill,产出报告并写回 job。"""
+        from .skills import BaseSkill, SkillPermission
+        from .skills.research_template_skill import (
+            ResearchTemplateCompareSkill, ResearchTemplateCompetitorSkill,
+            ResearchTemplateDailySkill, ResearchTemplateOpeningSkill,
+            ResearchTemplateSurveySkill,
+        )
+        skill_cls_map = {
+            "research_template_survey": ResearchTemplateSurveySkill,
+            "research_template_compare": ResearchTemplateCompareSkill,
+            "research_template_competitor": ResearchTemplateCompetitorSkill,
+            "research_template_daily": ResearchTemplateDailySkill,
+            "research_template_opening": ResearchTemplateOpeningSkill,
+        }
+        skill_cls = skill_cls_map.get(template_id, ResearchTemplateSurveySkill)
+        skill = skill_cls()
+        allowed = {SkillPermission.FILESYSTEM_READ,
+                   SkillPermission.FILESYSTEM_WRITE,
+                   SkillPermission.NETWORK,
+                   SkillPermission.PAID_API}
+        def _run():
+            from .skills import SkillResult
+            job = self.jobs.get(job_id, {})
+            job["status"] = "running"
+            self._save_jobs_locked()
+            job.setdefault("events", []).append({
+                "kind": "template_start",
+                "title": f"启动模板: {template_id}",
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "data": {"template": template_id},
+            })
+            result = skill.invoke(allowed_permissions=allowed,
+                                  progress_callback=lambda e: None, **builder_args)
+            if not result.ok:
+                self.jobs[job_id]["status"] = "error"
+                self.jobs[job_id]["error"] = (
+                    result.error.to_dict() if result.error
+                    else {"code": "unknown"})
+                job.setdefault("events", []).append({
+                    "kind": "template_error",
+                    "title": "模板执行失败",
+                    "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "data": self.jobs[job_id]["error"],
+                })
+                self._save_jobs_locked()
+                return
+            data = result.data or {}
+            report_path = data.get("report_path")
+            if report_path:
+                self.jobs[job_id]["report_path"] = report_path
+            self.jobs[job_id]["template_data"] = {
+                "template": data.get("template"),
+                "paper_count": data.get("paper_count"),
+                "summary_count": data.get("summary_count"),
+                "report_path": report_path,
+            }
+            self.jobs[job_id]["status"] = "done"
+            job.setdefault("events", []).append({
+                "kind": "template_done",
+                "title": "模板研究完成",
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "data": self.jobs[job_id]["template_data"],
+            })
+            self._save_jobs_locked()
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _build_template_args(self, template_id: str, query: str,
+                             payload: Dict[str, Any]) -> Dict[str, Any]:
+        """从 /api/run payload 提取模板参数。"""
+        def _int(name, default):
+            raw = payload.get(name)
+            try:
+                return int(raw) if raw not in (None, "") else default
+            except (TypeError, ValueError):
+                return default
+        sources = payload.get("sources") or None
+        year_from = _int("year_from", None)
+        if template_id == "research_template_survey":
+            return {"query": query,
+                    "max_results": _int("max_results", 20),
+                    "max_downloads": _int("max_downloads", 12),
+                    "year_from": year_from, "sources": sources,
+                    "download": bool(payload.get("download"))}
+        if template_id == "research_template_compare":
+            # 期望用户用「主题1,主题2,主题3」分号/逗号切分;否则按单个主题
+            raw = payload.get("topics")
+            if isinstance(raw, list) and len(raw) >= 2:
+                topics = [str(t).strip() for t in raw if str(t).strip()]
+            else:
+                topics = [t.strip() for t in (query or "").replace(";", ",")
+                          .split(",") if t.strip()]
+            if len(topics) < 2:
+                topics = [query, query]  # 兜底:同主题对比
+            return {"topics": topics[:5],
+                    "max_results": _int("max_results", 6),
+                    "year_from": year_from, "sources": sources}
+        if template_id == "research_template_opening":
+            return {"query": query,
+                    "max_results": _int("max_results", 8),
+                    "year_from": year_from or 2022, "sources": sources}
+        if template_id == "research_template_competitor":
+            return {"papers": [{"title": query, "url": "",
+                                "source": "manual", "authors": [],
+                                "year": year_from or 2024}]}
+        if template_id == "research_template_daily":
+            return {"query": query,
+                    "days_back": _int("days_back", 7),
+                    "max_results": _int("max_results", 5), "sources": sources}
+        return {"query": query}
 
     def submit_comparison(self, topics: List[str], **options: Any) -> str:
         """把多主题对比纳入统一任务队列、暂停恢复和成本追踪。"""
@@ -768,6 +1220,28 @@ class ResearchWebApp:
             "has_analysis": bool(analysis),
         }
 
+    def export_memory(self, fmt: str = "markdown") -> Optional[Path]:
+        """将当前知识库导出到应用数据目录的 exports，供浏览器下载。"""
+        clean_fmt = str(fmt or "markdown").strip().lower()
+        aliases = {"md": "markdown", "markdown": "markdown", "json": "json"}
+        clean_fmt = aliases.get(clean_fmt, "")
+        if not clean_fmt:
+            raise ValueError("memory export format 仅支持 json 或 markdown")
+        try:
+            self.exports_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            suffix = ".json" if clean_fmt == "json" else ".md"
+            path = self.exports_dir / f"paper_studio_memory_{stamp}{suffix}"
+            if clean_fmt == "json":
+                content = json.dumps(self.memory.export_payload(), ensure_ascii=False,
+                                     indent=2)
+            else:
+                content = self.memory.export_markdown()
+            path.write_text(content, encoding="utf-8")
+            return path
+        except OSError:
+            return None
+
     def delete_from_mcp(self, target_type: str, target_id: str,
                         item_index: Optional[int] = None) -> Dict[str, Any]:
         """删除一个经确认的明确目标，不提供批量清空。"""
@@ -813,6 +1287,7 @@ class ResearchWebApp:
 
     def control_job(self, job_id: str, action: str) -> Optional[Dict[str, Any]]:
         """暂停、继续或取消任务；执行中的 I/O 会在完成后响应控制。"""
+        start_thread = False
         with self.lock:
             job = self.jobs.get(job_id)
             if job is None:
@@ -826,11 +1301,101 @@ class ResearchWebApp:
                 control.resume()
                 job["status"] = "running"
                 job["log"].write("[控制] 已继续研究\n")
+            elif action == "resume" and job["status"] == "interrupted":
+                job["status"] = "queued"
+                job["resume_count"] = int(job.get("resume_count") or 0) + 1
+                job["control"] = _JobControl()
+                job["log"].write(
+                    "[恢复] 正从上次保存的安全检查点重新调度任务\n")
+                self._append_event_locked(job_id, {
+                    "kind": "resume", "title": "恢复任务",
+                    "detail": "已从应用关闭前的安全检查点重新调度。",
+                    "data": {"resume_count": job["resume_count"]},
+                }, persist=False)
+                start_thread = True
             elif action == "cancel" and job["status"] in (
-                    "queued", "running", "paused"):
+                    "queued", "running", "paused", "interrupted", "restarting"):
+                previous_status = job["status"]
                 control.cancel()
                 job["status"] = "cancelling"
                 job["log"].write("[控制] 已请求取消，将在当前步骤结束后停止\n")
+                if job.get("started_ts") is None or previous_status == "interrupted":
+                    job["status"] = "cancelled"
+                    job["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    job["finished_ts"] = time.time()
+            self._save_jobs_locked()
+            view = self._job_view(job)
+        if start_thread:
+            self._start_job_thread(job_id)
+        return view
+
+    def update_job_intervention(self, job_id: str,
+                                payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Update a paused/recovered task before resuming it.
+
+        Query changes intentionally invalidate earlier search checkpoints;
+        direction/exclusion edits preserve the checkpoint and are applied to
+        the next safe re-dispatch.  This makes the trade-off visible instead
+        of mixing evidence from two different research questions.
+        """
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise LookupError("研究任务不存在")
+            if job.get("status") not in {"paused", "interrupted", "queued"}:
+                raise RuntimeError("请先暂停任务，再调整查询、排除文献或补充方向")
+            intervention = dict(job.get("intervention") or {})
+            changed: Dict[str, Any] = {}
+            if "query" in payload:
+                query = str(payload.get("query") or "").strip()
+                if not query or len(query) > 500:
+                    raise ValueError("研究查询必须为 1-500 个字符")
+                if query != job["query"]:
+                    job["query"] = query
+                    job["desc"] = re.sub(r"（.*$", "", job.get("desc", query)) + "（已人工调整）"
+                    job["checkpoint"] = None
+                    changed["query"] = query
+            if "research_direction" in payload:
+                direction = str(payload.get("research_direction") or "").strip()
+                if len(direction) > 2000:
+                    raise ValueError("补充研究方向不能超过 2000 个字符")
+                intervention["research_direction"] = direction
+                changed["research_direction"] = direction
+            if "exclude_titles" in payload:
+                raw_titles = payload.get("exclude_titles") or []
+                if not isinstance(raw_titles, list):
+                    raise ValueError("exclude_titles 必须是数组")
+                titles: List[str] = []
+                seen = set()
+                for raw in raw_titles[:100]:
+                    title = str(raw or "").strip()
+                    key = " ".join(title.casefold().split())
+                    if title and len(title) <= 500 and key not in seen:
+                        titles.append(title)
+                        seen.add(key)
+                intervention["exclude_titles"] = titles
+                changed["exclude_titles"] = titles
+                # Previously completed rounds may contain one of these
+                # papers.  Restart from a clean research checkpoint so the
+                # final report cannot silently retain an excluded source.
+                job["checkpoint"] = None
+            if not changed:
+                return self._job_view(job)
+            job["intervention"] = intervention
+            job.setdefault("intervention_history", []).append({
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "changes": self._safe_trace_value(changed),
+            })
+            job["intervention_history"] = job["intervention_history"][-30:]
+            job["log"].write("[人工介入] 已保存调整；继续后将在下一个安全检查点生效\n")
+            self._append_event_locked(job_id, {
+                "kind": "intervention", "title": "人工调整已保存",
+                "detail": "继续任务后会从安全检查点应用最新研究范围。",
+                "data": changed,
+            }, persist=False)
+            if job.get("status") == "paused":
+                job["control"].restart()
+            self._save_jobs_locked()
             return self._job_view(job)
 
     def delete_job(self, job_id: str) -> str:
@@ -839,7 +1404,7 @@ class ResearchWebApp:
             job = self.jobs.get(job_id)
             if job is None:
                 return "not_found"
-            if job["status"] not in {"done", "error", "cancelled"}:
+            if job["status"] not in {"done", "error", "cancelled", "interrupted"}:
                 return "active"
             del self.jobs[job_id]
             changed = False
@@ -849,6 +1414,7 @@ class ResearchWebApp:
                     changed = True
             if changed:
                 self._save_schedules()
+            self._save_jobs_locked()
             return "deleted"
 
     def clear_finished_jobs(self) -> int:
@@ -868,6 +1434,7 @@ class ResearchWebApp:
                     changed = True
             if changed:
                 self._save_schedules()
+            self._save_jobs_locked()
             return len(finished_ids)
 
     def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
@@ -910,6 +1477,10 @@ class ResearchWebApp:
             return {"stage": "等待执行", "progress": 0}
         if status == "paused":
             return {"stage": f"已暂停 · {stage}", "progress": progress}
+        if status == "interrupted":
+            return {"stage": f"等待恢复 · {stage}", "progress": progress}
+        if status == "restarting":
+            return {"stage": "正在应用人工调整", "progress": progress}
         if status == "cancelling":
             return {"stage": "正在安全取消", "progress": progress}
         if status == "cancelled":
@@ -939,6 +1510,11 @@ class ResearchWebApp:
             "started_at": job["started_at"],
             "finished_at": job["finished_at"],
             "elapsed_seconds": elapsed,
+            "options": cls._job_options_view(job.get("options") or {}),
+            "intervention": cls._safe_trace_value(job.get("intervention") or {}),
+            "checkpoint": cls._safe_trace_value(job.get("checkpoint")),
+            "events": cls._safe_trace_value((job.get("events") or [])[-200:]),
+            "resume_count": int(job.get("resume_count") or 0),
             **stage,
         }
 
@@ -955,42 +1531,110 @@ class ResearchWebApp:
         return views
 
     # ------------------------------------------------------------------
-    def _work(self, job_id: str, query: str,
-              opts: Dict[str, Any]) -> None:
+    def _work(self, job_id: str) -> None:
         with self.lock:
-            job = self.jobs[job_id]
+            job = self.jobs.get(job_id)
+            if job is None:
+                return
             if job["status"] == "cancelling":
                 job["status"] = "cancelled"
                 job["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 job["finished_ts"] = time.time()
+                self._save_jobs_locked()
                 return
             job["status"] = ("paused" if job["control"].paused else "running")
-            job["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            job["started_ts"] = time.time()
+            if not job.get("started_at"):
+                job["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            if not job.get("started_ts"):
+                job["started_ts"] = time.time()
             buf = job["log"]
+            query = str(job["query"])
+            opts = dict(job.get("options") or {})
+            intervention = dict(job.get("intervention") or {})
+            opts["exclude_titles"] = list(intervention.get("exclude_titles") or [])
+            opts["research_direction"] = str(
+                intervention.get("research_direction") or "")
+            opts["resume_state"] = job.get("checkpoint")
+            opts["event_callback"] = lambda event: self._record_job_event(job_id, event)
+            opts["state_callback"] = lambda state: self._record_job_checkpoint(job_id, state)
+            self._append_event_locked(job_id, {
+                "kind": "execution", "title": "开始执行研究",
+                "detail": "已进入可恢复执行器。",
+                "data": {"query": query, "options": self._job_options_view(opts)},
+            }, persist=False)
+            self._save_jobs_locked()
         _PRINT_INTERCEPTOR.set_thread_buf(buf)
         try:
             result = self.runner(query, checkpoint=job["control"].checkpoint,
                                  **opts)
+            report_path = result.get("report_path") if isinstance(result, dict) else None
+            if report_path:
+                # A completed report gets an immutable first snapshot.  Later
+                # manual snapshots let the reader preserve edits or review
+                # milestones without overwriting the original Markdown.
+                self._create_report_version_path(
+                    Path(str(report_path)), label="任务完成")
             with self.lock:
+                job = self.jobs.get(job_id)
+                if job is None:
+                    return
                 job["status"] = "done"
                 job["result"] = result
                 job["report_path"] = result.get("report_path")
                 job["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 job["finished_ts"] = time.time()
+                self._append_event_locked(job_id, {
+                    "kind": "completed", "title": "研究任务已完成",
+                    "detail": "最终报告与完整执行记录已保存。",
+                    "data": {"report_path": job["report_path"]},
+                }, persist=False)
+                self._save_jobs_locked()
+        except JobRestartRequested as err:
+            with self.lock:
+                job = self.jobs.get(job_id)
+                if job is None:
+                    return
+                job["status"] = "queued"
+                job["control"] = _JobControl()
+                job["resume_count"] = int(job.get("resume_count") or 0) + 1
+                job["log"].write(f"[恢复] {err}\n")
+                self._append_event_locked(job_id, {
+                    "kind": "resume", "title": "应用人工调整并重新调度",
+                    "detail": str(err),
+                    "data": {"resume_count": job["resume_count"]},
+                }, persist=False)
+                self._save_jobs_locked()
+            self._start_job_thread(job_id)
         except JobCancelled as err:
             with self.lock:
+                job = self.jobs.get(job_id)
+                if job is None:
+                    return
                 job["status"] = "cancelled"
                 job["error"] = str(err)
                 job["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 job["finished_ts"] = time.time()
+                self._append_event_locked(job_id, {
+                    "kind": "cancelled", "title": "研究任务已取消",
+                    "detail": str(err), "data": {},
+                }, persist=False)
+                self._save_jobs_locked()
             print(f"\n[取消] {err}")
         except Exception as err:  # noqa: BLE001
             with self.lock:
+                job = self.jobs.get(job_id)
+                if job is None:
+                    return
                 job["status"] = "error"
                 job["error"] = f"{err}\n{traceback.format_exc()[-600:]}"
                 job["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 job["finished_ts"] = time.time()
+                self._append_event_locked(job_id, {
+                    "kind": "failure", "title": "执行失败",
+                    "detail": str(err),
+                    "data": {"error_type": err.__class__.__name__},
+                }, persist=False)
+                self._save_jobs_locked()
             print(f"\n[错误] {err}")
         finally:
             buf.flush()
@@ -1009,29 +1653,21 @@ class ResearchWebApp:
                         summarize_limit: Optional[int] = None,
                         analyze_citations: bool = True,
                         topics: Optional[List[str]] = None,
+                        library_selection: Optional[List[Dict[str, Any]]] = None,
                         download_interval: float = 2.0,
                         checkpoint: Optional[Callable[[], None]] = None,
+                        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+                        state_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+                        resume_state: Optional[Dict[str, Any]] = None,
+                        exclude_titles: Optional[List[str]] = None,
+                        research_direction: str = "",
                         **_: Any) -> Dict[str, Any]:
-        """默认执行器：按设置构造双模式 LLM + 成本追踪。"""
+        """Create the research engine from the selected provider profile."""
         provider = provider or self.settings.get("provider", "auto")
-        model = model or self.settings.get("model")
-        budget = budget_cny if budget_cny is not None \
-            else self.settings.get("budget_cny")
-        self.tracker.set_budget(budget)
-
-        # 自动模式也应尊重用户填入的 Ollama 自定义端点。
-        if provider == "auto":
-            local = LLMClient(provider="ollama",
-                              base_url=self.settings.get("ollama_base_url"))
-            provider = "ollama" if local.available else "deepseek"
-        base_url = (self.settings.get("ollama_base_url")
-                    if provider == "ollama"
-                    else self.settings.get("deepseek_base_url"))
-        llm = LLMClient(provider=provider, model=model,
-                        base_url=base_url,
-                        api_key=self.settings.get("api_key"),
-                        timeout=int(self.settings.get("llm_timeout", 90)),
-                        cost_tracker=self.tracker)
+        self.tracker.set_budget(None)
+        llm, _profile = self._configured_llm(
+            str(provider), model=model, track_usage=True,
+            event_callback=event_callback)
         from .core import (CrossPaperAnalyzer, LLMPlanner, MultiTopicComparator,
                            PaperSummarizer, ResearchAgent, ResearchLoop)
         from .plugins import DataAcquisitionPipeline
@@ -1061,7 +1697,33 @@ class ResearchWebApp:
             "download": download,
             "max_downloads": max_downloads,
             "download_interval": download_interval,
+            "exclude_titles": list(exclude_titles or []),
+            "research_direction": research_direction,
         }
+        memory_reuse: List[Dict[str, Any]] = []
+        # 深度模式的每轮复用由 ResearchLoop 统一管理；其它研究模式同样
+        # 在启动时检索本地知识库，避免“只有深度研究才会记忆”的断层。
+        if mode != "deep" and str(query or "").strip():
+            reuse = self.memory.prepare_reuse(str(query), limit=3,
+                                              exclude_query=str(query))
+            memory_reuse = list(reuse.get("matches") or [])
+            if memory_reuse:
+                overrides["historical_context"] = str(reuse.get("context") or "")
+                overrides["historical_reuse"] = memory_reuse
+                if event_callback is not None:
+                    event_callback({"kind": "memory_reuse", "title": "复用历史研究",
+                                    "data": {"items": memory_reuse,
+                                             "mode": "semantic"}})
+        if library_selection:
+            selected_papers = self._library_selected_papers(library_selection)
+            if not selected_papers:
+                raise ValueError("已选本地文献不存在，无法继续研究")
+            overrides["existing_papers"] = selected_papers
+            overrides["download"] = False
+            if event_callback is not None:
+                event_callback({"kind": "library_evidence", "title": "复用本地文献",
+                                "data": {"total": len(selected_papers),
+                                         "selection": library_selection}})
         if mode == "deep":
             loop = ResearchLoop(agent=agent, max_rounds=rounds,
                                 branching=branching, max_queries=max_queries,
@@ -1070,6 +1732,9 @@ class ResearchWebApp:
                                 analyze_citations=bool(analyze_citations))
             result = loop.run(query, max_results=max_results,
                               checkpoint=checkpoint,
+                              event_callback=event_callback,
+                              state_callback=state_callback,
+                              resume_state=resume_state,
                               **overrides)
         elif mode == "compare":
             comparison_topics = list(topics or [])
@@ -1085,95 +1750,558 @@ class ResearchWebApp:
             result = agent.run(query, max_results=max_results,
                                summarize=True, analyze=True,
                                checkpoint=checkpoint,
+                               event_callback=event_callback,
                                **overrides)
+        if mode != "deep":
+            result["memory_reuse"] = memory_reuse
         result["cost"] = self.tracker.to_dict()
         result["provider_status"] = llm.status()
         return result
 
-    def provider_status(self) -> Dict[str, Any]:
-        """返回界面当前选择的模型状态，而非只读取 .env 默认值。"""
-        provider = self.settings.get("provider") or "auto"
-        if provider == "auto":
-            local = LLMClient(provider="ollama",
-                              base_url=self.settings.get("ollama_base_url"))
-            provider = "ollama" if local.available else "deepseek"
+    def _provider_key(self, profile: Dict[str, Any]) -> tuple[str, str]:
+        """Return ``(key, source)`` without exposing it to public responses."""
+        profile_id = str(profile.get("id") or "")
+        secrets_map = self.settings.setdefault("provider_api_keys", {})
+        if profile_id in secrets_map:
+            value = str(secrets_map.get(profile_id) or "")
+            sources = self.settings.setdefault("provider_key_sources", {})
+            source = str(sources.get(profile_id) or "session")
+            return value, source if value else "none"
+        # Backwards-compatible DeepSeek key injected by older desktop clients.
+        if profile_id == "deepseek" and self.settings.get("api_key") is not None:
+            value = str(self.settings.get("api_key") or "")
+            return value, "session" if value else "none"
+        env_name = str(profile.get("api_key_env") or "")
+        value = str(config_get(env_name) or "") if env_name else ""
+        return value, "environment" if value else "none"
+
+    def _client_for_profile(self, profile: Dict[str, Any], *,
+                            model: Optional[str] = None,
+                            track_usage: bool = False,
+                            api_key_override: Optional[str] = None,
+                            event_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+                            ) -> LLMClient:
+        key = (api_key_override if api_key_override is not None
+               else self._provider_key(profile)[0])
+        provider_id = str(profile["id"])
+        chosen_model = str(model or profile.get("default_model") or "").strip()
+        tracker = self.tracker if track_usage and provider_id in {
+            "ollama", "deepseek"} else None
         return LLMClient(
-            provider=provider,
-            model=self.settings.get("model"),
-            base_url=(self.settings.get("ollama_base_url")
-                      if provider == "ollama"
-                      else self.settings.get("deepseek_base_url")),
-            api_key=self.settings.get("api_key"),
-        ).status()
+            provider=provider_id,
+            provider_type=str(profile.get("kind") or "openai"),
+            provider_name=str(profile.get("name") or provider_id),
+            requires_api_key=bool(profile.get("requires_api_key", True)),
+            model=chosen_model,
+            base_url=str(profile.get("base_url") or ""),
+            api_key=key,
+            timeout=int(self.settings.get("llm_timeout", 90)),
+            cost_tracker=tracker,
+            event_callback=event_callback,
+        )
+
+    def _configured_llm(self, provider_id: str = "auto", *,
+                        model: Optional[str] = None,
+                        track_usage: bool = False,
+                        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+                        ) -> tuple[LLMClient, Dict[str, Any]]:
+        profiles = self.settings.get("provider_profiles") or []
+        requested = str(provider_id or "auto").strip().lower()
+        profile: Optional[Dict[str, Any]] = None
+        if requested == "auto":
+            local = profile_by_id(profiles, "ollama")
+            if local is not None:
+                local_client = self._client_for_profile(local)
+                if local_client.available:
+                    profile = local
+            if profile is None:
+                for candidate in profiles:
+                    if candidate.get("kind") == "ollama":
+                        continue
+                    candidate_client = self._client_for_profile(candidate)
+                    if candidate_client.available:
+                        profile = candidate
+                        break
+            if profile is None:
+                profile = (profile_by_id(profiles, "deepseek")
+                           or next(iter(profiles), None))
+        else:
+            profile = profile_by_id(profiles, requested)
+        if profile is None:
+            raise ValueError(f"模型服务商不存在：{requested}")
+
+        chosen_model = model
+        if not chosen_model and requested != "auto" \
+                and requested == self.settings.get("provider"):
+            chosen_model = self.settings.get("model")
+        chosen_model = chosen_model or profile.get("default_model")
+        client = self._client_for_profile(
+            profile, model=str(chosen_model or ""), track_usage=track_usage,
+            event_callback=event_callback)
+        # Fail over only between configured OpenAI-compatible cloud profiles.
+        # Local Ollama is intentionally not a silent substitute: its model,
+        # speed and result quality are a user decision, not a transport retry.
+        if client.provider_type == "openai":
+            alternatives: List[LLMClient] = []
+            for candidate in profiles:
+                if candidate.get("id") == profile.get("id") or candidate.get("kind") != "openai":
+                    continue
+                fallback = self._client_for_profile(
+                    candidate,
+                    model=str(candidate.get("default_model") or ""),
+                    track_usage=track_usage, event_callback=event_callback)
+                if fallback.available:
+                    alternatives.append(fallback)
+            client.set_failovers(alternatives)
+        return client, profile
+
+    def provider_status(self, provider_id: Optional[str] = None, *,
+                        model: Optional[str] = None,
+                        verify: bool = False) -> Dict[str, Any]:
+        """Return status for the active or explicitly requested profile.
+
+        传入 ``model`` 时覆盖档案默认值，让 Web「检查连接」按钮校验的正是
+        界面上当前选中的服务商 + 模型组合，而不是上一次保存的选择。
+        """
+        requested = provider_id or str(self.settings.get("provider") or "auto")
+        client, profile = self._configured_llm(requested, model=model)
+        status = client.probe(verify_model=True) if verify else client.status()
+        status.update({
+            "requested_provider": requested,
+            "automatic": requested == "auto",
+            "profile": profile["id"],
+            # Echo the exact model accepted by this request.  The settings UI
+            # uses this instead of a cached default model, so a late response
+            # can never be presented as the result of another model check.
+            "checked_model": client.model,
+        })
+        return status
+
+    def test_provider_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Verify an editor draft with a real, one-token model inference.
+
+        The draft and an optionally entered API key are intentionally used
+        only for this request.  This lets users prove a new URL / model / key
+        combination before deciding to save it, and avoids mistaking an older
+        saved profile for the one currently being edited.
+        """
+        raw_profile = payload.get("profile")
+        if not isinstance(raw_profile, dict):
+            raise ValueError("profile 必须是模型服务商配置对象")
+        raw_id = str(raw_profile.get("id") or "").strip().lower()
+        if not raw_id:
+            raise ValueError("服务商 ID 不能为空")
+        profile = profile_by_id(sanitize_provider_profiles([raw_profile]), raw_id)
+        if profile is None:  # Defensive: sanitize currently always preserves it.
+            raise ValueError("模型服务商配置无效")
+
+        raw_model = payload.get("model", profile.get("default_model"))
+        if raw_model is not None and not isinstance(raw_model, str):
+            raise ValueError("模型名称必须是字符串")
+        model = str(raw_model or "").strip()
+        if not model:
+            raise ValueError("请填写要真实验证的模型名称")
+        if len(model) > 200:
+            raise ValueError("模型名称不能超过 200 个字符")
+
+        supplied_key = payload.get("api_key")
+        if supplied_key is not None and not isinstance(supplied_key, str):
+            raise ValueError("API Key 必须是字符串")
+        if supplied_key is not None and len(supplied_key) > 10000:
+            raise ValueError("API Key 长度超过限制")
+        # An empty input means “keep using the already configured key”, just
+        # like the editor's password field.  A non-empty key never reaches
+        # settings storage and is discarded once this request returns.
+        transient_key = (supplied_key.strip() if supplied_key and supplied_key.strip()
+                         else None)
+        client = self._client_for_profile(
+            profile, model=model, api_key_override=transient_key)
+        status = client.probe(verify_model=True)
+        status.update({
+            "profile": profile["id"],
+            "checked_model": client.model,
+            "test_mode": "live_inference",
+            "key_source": ("entered_for_test" if transient_key is not None
+                           else self._provider_key(profile)[1]),
+        })
+        return status
 
     def public_settings(self) -> Dict[str, Any]:
         """脱敏后的设置，允许浏览器读取。"""
-        session_key = bool(self.settings.get("api_key"))
-        environment_key = bool(LLMClient(provider="deepseek").api_key)
+        profiles = []
+        for raw in self.settings.get("provider_profiles") or []:
+            profile = dict(raw)
+            key, source = self._provider_key(profile)
+            profile["has_api_key"] = bool(key)
+            profile["api_key_source"] = source
+            profiles.append(profile)
+        deepseek = profile_by_id(profiles, "deepseek") or {}
         return {
             "provider": self.settings.get("provider", "auto"),
             "model": self.settings.get("model"),
-            "budget_cny": self.settings.get("budget_cny"),
+            "provider_profiles": profiles,
             "llm_timeout": self.settings.get("llm_timeout", 90),
             "download_interval": self.settings.get("download_interval", 2.0),
             "download_retries": self.settings.get("download_retries", 4),
             "download_timeout": self.settings.get("download_timeout", 90),
-            "ollama_base_url": self.settings.get("ollama_base_url"),
-            "deepseek_base_url": self.settings.get("deepseek_base_url"),
-            # Never return the secret itself.  The source lets the interface
-            # explain persistence accurately: process session vs. environment.
-            "has_api_key": session_key or environment_key,
-            "api_key_source": ("session" if session_key else
-                               "environment" if environment_key else "none"),
+            # Legacy status fields keep older Web/desktop clients functional.
+            "ollama_base_url": (profile_by_id(profiles, "ollama") or {}).get(
+                "base_url", "").removesuffix("/v1"),
+            "deepseek_base_url": deepseek.get("base_url", "").removesuffix("/v1"),
+            "has_api_key": bool(deepseek.get("has_api_key")),
+            "api_key_source": deepseek.get("api_key_source", "none"),
+            "model_config_file": self.settings_path.name,
         }
+
+    @staticmethod
+    def _credential_storage_label(source: str) -> str:
+        """Human-readable, non-secret credential storage metadata."""
+        return {
+            "electron_safe_storage": "系统安全存储（Electron safeStorage）",
+            "environment": "环境变量",
+            "session": "当前 Web 服务会话",
+            "none": "未配置",
+        }.get(source, "受管凭据存储")
+
+    def _model_config_document(self) -> Dict[str, Any]:
+        """Build the safe, user-readable model configuration document.
+
+        This is intentionally the only document written as
+        ``model_config.json``.  It includes provider routing and references
+        for credentials, never the credential values themselves.
+        """
+        profiles = persistent_profiles(
+            self.settings.get("provider_profiles") or [])
+        return {
+            "schema_version": 1,
+            "application": "Paper Studio",
+            "model_routing": {
+                "default_provider": self.settings.get("provider", "auto"),
+                "default_model": self.settings.get("model", ""),
+                "request_timeout_seconds": self.settings.get("llm_timeout", 90),
+            },
+            "provider_profiles": profiles,
+            "credential_management": {
+                "policy": "API Key values are never written to this file.",
+                "desktop": {
+                    "storage": "Electron safeStorage",
+                    "reference": "provider-secrets.bin",
+                    "note": "The encrypted vault is restored automatically when the desktop app starts.",
+                },
+                "web": {
+                    "storage": "environment variables or current process memory",
+                    "note": "For standalone Web mode, use a provider environment variable for persistent credentials.",
+                },
+                "provider_references": [
+                    {
+                        "provider_id": str(profile.get("id") or ""),
+                        "requires_api_key": bool(profile.get("requires_api_key")),
+                        "secret_reference": (
+                            f"provider-secrets.bin#{profile.get('id')}"
+                            if profile.get("requires_api_key") else None),
+                    }
+                    for profile in profiles
+                ],
+            },
+            "download_defaults": {
+                "interval_seconds": self.settings.get("download_interval", 2.0),
+                "retries": self.settings.get("download_retries", 4),
+                "timeout_seconds": self.settings.get("download_timeout", 90),
+            },
+        }
+
+    def model_config_view(self) -> Dict[str, Any]:
+        """Return a safe config-file preview plus live credential statuses."""
+        document = self._model_config_document()
+        credentials = []
+        for profile in self.settings.get("provider_profiles") or []:
+            key, source = self._provider_key(profile)
+            requires_key = bool(profile.get("requires_api_key"))
+            credentials.append({
+                "provider_id": profile.get("id"),
+                "provider_name": profile.get("name"),
+                "required": requires_key,
+                "configured": bool(key) if requires_key else True,
+                "storage": (self._credential_storage_label(source)
+                            if requires_key else "无需 API Key"),
+                "value": "[不会显示或写入配置文件]",
+            })
+        return {
+            "file_name": self.settings_path.name,
+            "file_path": str(self.settings_path),
+            "format": "json",
+            "content": json.dumps(document, ensure_ascii=False, indent=2),
+            "credentials": credentials,
+        }
+
+    def provider_presets_view(self) -> Dict[str, Any]:
+        """返回服务商模板市场(国内 / 国际 / 本地 / 网关),供设置页一键添加。"""
+        from .core.provider_profiles import (
+            PROVIDER_GROUPS, default_provider_profiles, providers_by_region,
+        )
+        all_profiles = default_provider_profiles()
+        existing_ids = {p.get("id") for p in
+                        (self.settings.get("provider_profiles") or [])}
+        enriched = []
+        for profile in all_profiles:
+            enriched.append({
+                "id": profile["id"],
+                "name": profile["name"],
+                "kind": profile["kind"],
+                "base_url": profile["base_url"],
+                "default_model": profile.get("default_model", ""),
+                "models": profile.get("models", []),
+                "requires_api_key": profile.get("requires_api_key", True),
+                "api_key_env": profile.get("api_key_env", ""),
+                "accent": profile.get("accent", "blue"),
+                "region": profile.get("region", "intl"),
+                "tier": profile.get("tier", "direct"),
+                "tags": profile.get("tags", []),
+                "already_added": profile["id"] in existing_ids,
+            })
+        return {
+            "groups": PROVIDER_GROUPS,
+            "by_region": providers_by_region(),
+            "presets": enriched,
+            "count": len(enriched),
+        }
+
+    def provider_quick_add(self, provider_id: str) -> Dict[str, Any]:
+        """一键添加服务商到当前设置,返回新增项；已存在则返回已存在项。"""
+        from .core.provider_profiles import default_provider_profiles
+        target = next((p for p in default_provider_profiles()
+                       if p["id"] == provider_id), None)
+        if target is None:
+            raise ValueError(f"未知的预设服务商: {provider_id}")
+        profiles = list(self.settings.get("provider_profiles") or [])
+        existing = next((p for p in profiles if p.get("id") == provider_id), None)
+        if existing:
+            return {"status": "exists", "profile": existing}
+        # 用作新增条目,只保留「必要」字段(避免把默认列表的 accent 之类当持久数据)
+        new_profile = {
+            "id": target["id"], "name": target["name"],
+            "kind": target["kind"], "base_url": target["base_url"],
+            "models": list(target.get("models") or []),
+            "default_model": target.get("default_model", ""),
+            "requires_api_key": target.get("requires_api_key", True),
+            "api_key_env": target.get("api_key_env", ""),
+        }
+        profiles.append(new_profile)
+        self.settings["provider_profiles"] = profiles
+        self._save_settings()
+        return {"status": "added", "profile": new_profile}
 
     def _load_settings(self) -> None:
         """恢复非敏感的模型设置；API Key 始终由 Electron 安全存储处理。"""
-        if not self.settings_path.exists():
+        source_path = self.settings_path
+        if not source_path.exists():
+            source_path = next(
+                (path for path in self.legacy_settings_paths if path.exists()),
+                source_path)
+        if not source_path.exists():
             return
         try:
-            data = json.loads(self.settings_path.read_text(encoding="utf-8"))
-            for key in ("provider", "model", "budget_cny", "llm_timeout",
-                        "download_interval", "download_retries", "download_timeout",
-                        "ollama_base_url", "deepseek_base_url"):
+            data = json.loads(source_path.read_text(encoding="utf-8"))
+            if "provider_profiles" in data:
+                self.settings["provider_profiles"] = sanitize_provider_profiles(
+                    data.get("provider_profiles"))
+            else:
+                # Migrate v0.0.x endpoint fields into the new profile catalog.
+                profiles = default_provider_profiles()
+                for profile_id, legacy_key in (
+                        ("ollama", "ollama_base_url"),
+                        ("deepseek", "deepseek_base_url")):
+                    profile = profile_by_id(profiles, profile_id)
+                    value = str(data.get(legacy_key) or "").rstrip("/")
+                    if profile is not None and value:
+                        profile["base_url"] = (value if value.endswith("/v1")
+                                               else value + "/v1")
+                self.settings["provider_profiles"] = profiles
+            for key in ("provider", "model", "llm_timeout",
+                        "download_interval", "download_retries", "download_timeout"):
                 if key in data:
                     self.settings[key] = data[key]
+            valid = {profile["id"] for profile in self.settings["provider_profiles"]}
+            if self.settings.get("provider") not in valid | {"auto"}:
+                self.settings["provider"] = "auto"
+            # v0.0.x stored one global model. Fold it into the selected v0.1
+            # provider profile so the card, model selector and runtime agree.
+            selected = str(self.settings.get("provider") or "auto")
+            selected_model = str(self.settings.get("model") or "").strip()
+            selected_profile = profile_by_id(
+                self.settings["provider_profiles"], selected)
+            if selected_profile is not None and selected_model:
+                selected_profile["default_model"] = selected_model
+                if selected_model.casefold() not in {
+                        str(item).casefold()
+                        for item in selected_profile.get("models", [])}:
+                    selected_profile.setdefault("models", []).insert(
+                        0, selected_model)
+            # Migrate the legacy generic settings file to the explicit,
+            # user-facing model config file without deleting the old file.
+            if source_path != self.settings_path:
+                self._save_settings()
         except (OSError, ValueError, TypeError):
             pass
 
     def _save_settings(self) -> None:
-        safe = self.public_settings()
-        safe.pop("has_api_key", None)
+        # Keep the familiar top-level keys for v0.1.x migrations while also
+        # providing a self-describing model configuration file to the user.
+        safe = self._model_config_document()
+        safe.update({
+            "version": 3,
+            "provider": self.settings.get("provider", "auto"),
+            "model": self.settings.get("model"),
+            "llm_timeout": self.settings.get("llm_timeout", 90),
+            "download_interval": self.settings.get("download_interval", 2.0),
+            "download_retries": self.settings.get("download_retries", 4),
+            "download_timeout": self.settings.get("download_timeout", 90),
+        })
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         self.settings_path.write_text(json.dumps(safe, ensure_ascii=False,
                                                  indent=2), encoding="utf-8")
 
+    def update_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate, apply and persist non-secret settings and runtime keys."""
+        if "provider_profiles" in payload:
+            self.settings["provider_profiles"] = sanitize_provider_profiles(
+                payload.get("provider_profiles"))
+        elif any(key in payload for key in (
+                "ollama_base_url", "deepseek_base_url")):
+            # Keep v0.0.x clients working during the upgrade.
+            for profile_id, field in (("ollama", "ollama_base_url"),
+                                      ("deepseek", "deepseek_base_url")):
+                if field not in payload:
+                    continue
+                profile = profile_by_id(
+                    self.settings["provider_profiles"], profile_id)
+                value = str(payload.get(field) or "").strip().rstrip("/")
+                if not value.startswith(("http://", "https://")):
+                    raise ValueError(f"{field} 必须是 HTTP(S) 地址")
+                if profile is not None:
+                    profile["base_url"] = (value if value.endswith("/v1")
+                                           else value + "/v1")
+
+        profile_ids = {
+            str(profile["id"]) for profile in self.settings["provider_profiles"]}
+        secrets_map = self.settings.setdefault("provider_api_keys", {})
+        key_sources = self.settings.setdefault("provider_key_sources", {})
+        requested_storages: Dict[str, str] = {}
+        raw_storages = payload.get("credential_storages")
+        if raw_storages is not None:
+            if not isinstance(raw_storages, dict) or len(raw_storages) > 24:
+                raise ValueError("credential_storages 必须是服务商到存储方式的对象")
+            for raw_id, raw_storage in raw_storages.items():
+                profile_id = str(raw_id or "").strip().lower()
+                storage = str(raw_storage or "").strip().lower()
+                if profile_id not in profile_ids:
+                    raise ValueError(f"无法为未知服务商设置凭据存储：{profile_id}")
+                if storage not in {"electron_safe_storage", "session"}:
+                    raise ValueError("凭据存储方式不受支持")
+                requested_storages[profile_id] = storage
+        raw_keys = payload.get("api_keys")
+        if raw_keys is not None:
+            if not isinstance(raw_keys, dict) or len(raw_keys) > 24:
+                raise ValueError("api_keys 必须是服务商到 Key 的对象")
+            for raw_id, raw_value in raw_keys.items():
+                profile_id = str(raw_id or "").strip().lower()
+                if profile_id not in profile_ids:
+                    raise ValueError(f"无法为未知服务商保存 Key：{profile_id}")
+                if raw_value is not None and not isinstance(raw_value, str):
+                    raise ValueError("API Key 必须是字符串或 null")
+                value = str(raw_value or "").strip()
+                if len(value) > 10000:
+                    raise ValueError("API Key 长度超过限制")
+                secrets_map[profile_id] = value
+                if value:
+                    key_sources[profile_id] = requested_storages.get(
+                        profile_id, str(key_sources.get(profile_id) or "session"))
+                else:
+                    key_sources.pop(profile_id, None)
+        if "api_key" in payload:
+            # Legacy DeepSeek-only payload.
+            raw_value = payload.get("api_key")
+            if raw_value is not None and not isinstance(raw_value, str):
+                raise ValueError("api_key 必须是字符串或 null")
+            value = str(raw_value or "").strip()
+            secrets_map["deepseek"] = value
+            if value:
+                key_sources["deepseek"] = requested_storages.get(
+                    "deepseek", str(key_sources.get("deepseek") or "session"))
+            else:
+                key_sources.pop("deepseek", None)
+            self.settings["api_key"] = value
+
+        if "provider" in payload:
+            provider = str(payload.get("provider") or "auto").strip().lower()
+            if provider not in profile_ids | {"auto"}:
+                raise ValueError("选择的模型服务商不存在")
+            self.settings["provider"] = provider
+        if "model" in payload:
+            model = str(payload.get("model") or "").strip()
+            if len(model) > 200:
+                raise ValueError("模型名称不能超过 200 个字符")
+            self.settings["model"] = model
+
+        # A fixed default provider and its default model form one setting in
+        # the UI. Keep the profile itself synchronized so research, cards and
+        # future provider switches never show conflicting model names.
+        selected = str(self.settings.get("provider") or "auto")
+        selected_profile = profile_by_id(
+            self.settings["provider_profiles"], selected)
+        if selected_profile is not None:
+            selected_model = str(self.settings.get("model") or "").strip()
+            if not selected_model:
+                selected_model = str(
+                    selected_profile.get("default_model") or "").strip()
+                self.settings["model"] = selected_model
+            if selected_model:
+                selected_profile["default_model"] = selected_model
+                if selected_model.casefold() not in {
+                        str(item).casefold()
+                        for item in selected_profile.get("models", [])}:
+                    selected_profile.setdefault("models", []).insert(
+                        0, selected_model)
+
+        for key, default, minimum, maximum, caster in (
+                ("llm_timeout", 90, 10, 1800, int),
+                ("download_interval", 2.0, .5, 30.0, float),
+                ("download_retries", 4, 0, 8, int),
+                ("download_timeout", 90, 30, 600, int)):
+            if key not in payload:
+                continue
+            try:
+                value = caster(payload.get(key))
+                self.settings[key] = max(minimum, min(maximum, value))
+            except (TypeError, ValueError):
+                self.settings[key] = default
+
+        self.tracker.set_budget(None)
+        self._save_settings()
+        return self.public_settings()
+
+    def provider_models(self, provider_id: Optional[str] = None) -> Dict[str, Any]:
+        """Discover models for one profile without making a paid completion."""
+        requested = provider_id or str(self.settings.get("provider") or "auto")
+        client, profile = self._configured_llm(requested)
+        models = client.list_models()
+        return {
+            "provider": profile["id"], "provider_name": profile["name"],
+            "available": bool(models) or client.available,
+            "endpoint": client.base_url, "models": models,
+        }
+
     def ollama_models(self) -> Dict[str, Any]:
-        """从用户配置的 Ollama 服务读取已安装模型。"""
-        client = LLMClient(provider="ollama",
-                           base_url=self.settings.get("ollama_base_url"))
-        return {"available": client.available, "endpoint": client.base_url,
-                "models": client.list_ollama_models()}
+        """Compatibility wrapper for the old ``/api/models`` endpoint."""
+        return self.provider_models("ollama")
 
     def _skill_llm(self) -> LLMClient:
         """为 Skill 中心构造与研究任务相同的模型、预算和成本环境。"""
-        provider = str(self.settings.get("provider") or "auto")
-        if provider == "auto":
-            local = LLMClient(
-                provider="ollama",
-                base_url=self.settings.get("ollama_base_url"))
-            provider = "ollama" if local.available else "deepseek"
-        self.tracker.set_budget(self.settings.get("budget_cny"))
-        return LLMClient(
-            provider=provider,
-            model=self.settings.get("model"),
-            base_url=(self.settings.get("ollama_base_url")
-                      if provider == "ollama"
-                      else self.settings.get("deepseek_base_url")),
-            api_key=self.settings.get("api_key"),
-            timeout=int(self.settings.get("llm_timeout", 90)),
-            cost_tracker=self.tracker,
-        )
+        self.tracker.set_budget(None)
+        client, _profile = self._configured_llm(
+            str(self.settings.get("provider") or "auto"),
+            model=self.settings.get("model"), track_usage=True)
+        return client
 
     def skill_catalog(self) -> Dict[str, Any]:
         """返回可供 Web 检查和受控执行的标准 Skill 清单。"""
@@ -1184,9 +2312,25 @@ class ResearchWebApp:
         for name in sorted(manifests):
             manifest = dict(manifests[name])
             permissions = list(manifest.get("permissions") or [])
+            tags = list(manifest.get("tags") or [])
             manifest["confirmation_required"] = bool(
                 set(permissions) & _SKILL_CONFIRM_PERMISSIONS)
             manifest["web_invokable"] = True
+            # 推断分类:方便 UI 快速过滤
+            if "template" in tags:
+                category = "template"
+            elif any(t in tags for t in ("memory", "knowledge", "rag")):
+                category = "memory"
+            elif any(t in tags for t in ("search", "scrape", "download")):
+                category = "retrieval"
+            elif any(t in tags for t in ("summary", "analysis", "compare")):
+                category = "analysis"
+            elif "report" in tags or name in ("report_render", "report_write"):
+                category = "report"
+            else:
+                category = "general"
+            manifest["category"] = category
+            manifest["is_template"] = "template" in tags
             skills.append(manifest)
         return {
             "app_version": APP_VERSION,
@@ -1202,6 +2346,98 @@ class ResearchWebApp:
                 "destructive": "执行删除操作",
             },
         }
+
+    def agent_roles_catalog(self) -> Dict[str, Any]:
+        """返回 4 个研究角色 + 各自绑定的 Skill,供「主页 / 技能中心」使用。"""
+        from .core.agent_roles import build_role_summary, list_roles
+        roles = [build_role_summary(role) for role in list_roles()]
+        # 把每个 role 展开后包含其全部 primary_skills 的 name
+        return {
+            "app_version": APP_VERSION,
+            "count": len(roles),
+            "roles": roles,
+        }
+
+    def datasource_catalog(self) -> Dict[str, Any]:
+        """返回已注册的外部数据源 connector 列表(供 MCP / UI)。"""
+        from .datasources import list_connectors
+        configured = self.settings.get("datasource_configs") or {}
+        all_connectors = list_connectors()
+        for conn in all_connectors:
+            cid = conn["id"]
+            cfg = configured.get(cid) or {}
+            conn["configured"] = bool(cfg)
+            conn["has_secret"] = bool(cfg.get("api_key")
+                                      or cfg.get("integration_token")
+                                      or cfg.get("vault_path")
+                                      or cfg.get("endpoint"))
+        return {
+            "app_version": APP_VERSION,
+            "count": len(all_connectors),
+            "connectors": all_connectors,
+        }
+
+    def datasource_configure(self, connector_id: str,
+                            config: Dict[str, Any]) -> Dict[str, Any]:
+        """保存用户为某 connector 填写的配置(明文,但仅本机 JSON)。
+
+        注意:本机 settings.json 中只能放「非敏感」配置;真正的 token
+        仍由 Electron 安全存储管理,web 环境以 ``env_or_config`` 走环
+        境变量。"""
+        from .datasources import get_connector, DataSourceError
+        try:
+            instance = get_connector(connector_id, config=config)
+        except DataSourceError as err:
+            raise ValueError(str(err)) from err
+        # 过滤掉 base.py 的方法字段,只保留纯配置
+        clean: Dict[str, Any] = {}
+        for key, value in (config or {}).items():
+            if not isinstance(value, (str, int, float, bool, list)):
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            if len(str(value)) > 1000:
+                continue
+            clean[key] = value
+        all_cfg = dict(self.settings.get("datasource_configs") or {})
+        all_cfg[connector_id] = clean
+        self.settings["datasource_configs"] = all_cfg
+        self._save_settings()
+        return {"status": "saved", "connector_id": connector_id,
+                "config": clean}
+
+    def datasource_search(self, connector_id: str, query: str,
+                          limit: int = 10) -> Dict[str, Any]:
+        cfg = (self.settings.get("datasource_configs")
+               or {}).get(connector_id) or {}
+        from .datasources import get_connector, DataSourceError
+        try:
+            conn = get_connector(connector_id, config=cfg)
+            items = conn.search(query, limit=limit) or []
+        except DataSourceError as err:
+            return {"ok": False, "error": str(err), "items": []}
+        return {"ok": True, "items": [i.to_dict() for i in items]}
+
+    def datasource_fetch(self, connector_id: str, target: str) -> Dict[str, Any]:
+        cfg = (self.settings.get("datasource_configs")
+               or {}).get(connector_id) or {}
+        from .datasources import get_connector, DataSourceError
+        try:
+            conn = get_connector(connector_id, config=cfg)
+            result = conn.fetch(target)
+            return {"ok": True, "result": result.to_dict()}
+        except DataSourceError as err:
+            return {"ok": False, "error": str(err)}
+
+    def datasource_health(self, connector_id: str) -> Dict[str, Any]:
+        cfg = (self.settings.get("datasource_configs")
+               or {}).get(connector_id) or {}
+        from .datasources import get_connector, DataSourceError
+        try:
+            conn = get_connector(connector_id, config=cfg)
+            return conn.health()
+        except DataSourceError as err:
+            return {"ok": False, "error": str(err), "latency_ms": 0}
 
     def _skill_instance(self, name: str):
         from .skills import (BaseSkill, DownloaderSkill, PaperCompareSkill,
@@ -1480,6 +2716,284 @@ class ResearchWebApp:
         except ValueError:
             return None
 
+    @staticmethod
+    def _library_doc_key(run_id: str, index: int) -> str:
+        return f"{run_id}:{int(index)}"
+
+    @staticmethod
+    def _read_json_object(path: Path, fallback: Optional[Dict[str, Any]] = None
+                          ) -> Dict[str, Any]:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else (fallback or {})
+        except (OSError, TypeError, ValueError):
+            return fallback or {}
+
+    @staticmethod
+    def _write_json_object(path: Path, value: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+        temporary.replace(path)
+
+    def _library_manifest(self, run_id: str) -> tuple[Optional[Path], Dict[str, Any]]:
+        batch = self._library_batch_path(run_id)
+        if batch is None:
+            return None, {}
+        return batch, self._read_json_object(batch / "metadata.json")
+
+    @staticmethod
+    def _library_paper_data(data: Dict[str, Any], item: Dict[str, Any]
+                            ) -> Dict[str, Any]:
+        """Merge the download item with its original Paper record when present."""
+        merged = dict(item)
+        try:
+            index = int(item.get("index") or 0)
+        except (TypeError, ValueError):
+            index = 0
+        papers = data.get("papers") or []
+        original = (papers[index - 1] if isinstance(papers, list)
+                    and 0 < index <= len(papers) else {})
+        if isinstance(original, dict):
+            for key, value in original.items():
+                if key not in merged or merged.get(key) in (None, "", [], {}):
+                    merged[key] = value
+        return merged
+
+    @staticmethod
+    def _title_key(title: Any) -> str:
+        return " ".join(str(title or "").casefold().split())
+
+    @staticmethod
+    def _quality_tokens(value: Any) -> set[str]:
+        return set(re.findall(r"[a-z0-9]{2,}|[\u4e00-\u9fff]",
+                              str(value or "").casefold()))
+
+    def _score_library_item(self, item: Dict[str, Any], *,
+                            duplicate_count: int = 1,
+                            batch_query: str = "") -> Dict[str, Any]:
+        """Explainable, offline quality heuristic (not a peer-review verdict)."""
+        source = str(item.get("source") or "").casefold()
+        source_points = (25 if any(name in source for name in
+                          ("pubmed", "crossref", "openalex", "semantic"))
+                         else 21 if "arxiv" in source
+                         else 17 if "scholar" in source else 12)
+        try:
+            year = int(item.get("year") or 0)
+        except (TypeError, ValueError):
+            year = 0
+        current = time.localtime().tm_year
+        year_points = (15 if year >= current - 2 else 12 if year >= current - 5
+                       else 8 if year >= current - 10 else 5 if year else 3)
+        raw_citations = (item.get("citation_count", item.get("cited_by",
+                         item.get("citations", item.get("citationCount", 0)))))
+        try:
+            citations = max(0, int(raw_citations or 0))
+        except (TypeError, ValueError):
+            citations = 0
+        citation_points = (20 if citations >= 200 else 17 if citations >= 50
+                           else 14 if citations >= 10 else 9 if citations > 0
+                           else 4)
+        full_text = bool(item.get("text_exists"))
+        pdf = bool(item.get("pdf_exists"))
+        full_text_points = 20 if full_text else 14 if pdf else 3
+        duplicate_points = 10 if duplicate_count <= 1 else max(
+            0, 10 - min(10, (duplicate_count - 1) * 4))
+        query_tokens = self._quality_tokens(batch_query)
+        document_tokens = self._quality_tokens(
+            f"{item.get('title') or ''} {item.get('abstract') or ''}")
+        if query_tokens:
+            relevance = min(10, round(10 * len(query_tokens & document_tokens)
+                                      / max(1, len(query_tokens))))
+        else:
+            # Legacy batches often predate the persisted query field.  Do not
+            # punish them; surface the missing signal in the explanation.
+            relevance = 6
+        score = source_points + year_points + citation_points + full_text_points + duplicate_points + relevance
+        reasons = [
+            f"来源 {source_points}/25",
+            f"年份 {year_points}/15" + (f"（{year}）" if year else "（缺失）"),
+            f"引用 {citation_points}/20" + (f"（{citations}）" if citations else "（未收录）"),
+            f"全文 {full_text_points}/20",
+            f"重复度 {duplicate_points}/10" + (f"（{duplicate_count} 条同名）" if duplicate_count > 1 else ""),
+            f"相关性 {relevance}/10" + ("" if query_tokens else "（历史批次未保存查询）"),
+        ]
+        return {"score": int(max(0, min(100, score))), "components": {
+            "source": source_points, "year": year_points,
+            "citations": citation_points, "full_text": full_text_points,
+            "duplicate": duplicate_points, "relevance": relevance,
+        }, "citation_count": citations, "duplicate_count": duplicate_count,
+            "explanation": reasons,
+            "label": "辅助质量评分，不能替代同行评审"}
+
+    def _library_selected_papers(self, selection: Any) -> List[Dict[str, Any]]:
+        """Reconstruct selected papers on resume, using only the local manifest."""
+        if not isinstance(selection, list):
+            return []
+        result: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in selection[:50]:
+            if not isinstance(raw, dict):
+                continue
+            run_id = str(raw.get("run_id") or "")
+            try:
+                index = int(raw.get("index"))
+            except (TypeError, ValueError):
+                continue
+            key = self._library_doc_key(run_id, index)
+            if key in seen:
+                continue
+            _batch, data = self._library_manifest(run_id)
+            item = next((candidate for candidate in data.get("items", [])
+                         if isinstance(candidate, dict)
+                         and str(candidate.get("index", "")) == str(index)), None)
+            if item is None:
+                continue
+            paper = self._library_paper_data(data, item)
+            title = str(paper.get("title") or "").strip()
+            if not title:
+                continue
+            result.append({
+                "title": title,
+                "url": str(paper.get("url") or paper.get("pdf_url") or ""),
+                "source": str(paper.get("source") or "local_library"),
+                "authors": list(paper.get("authors") or []),
+                "year": paper.get("year"), "abstract": paper.get("abstract"),
+                "doi": paper.get("doi"), "pdf_url": paper.get("pdf_url"),
+                "venue": paper.get("venue"),
+                "extra": {"library_ref": {"run_id": run_id, "index": index}},
+            })
+            seen.add(key)
+        return result
+
+    def submit_library_research(self, query: str, selection: Any,
+                                **options: Any) -> str:
+        query = str(query or "").strip()
+        if not 1 <= len(query) <= 500:
+            raise ValueError("研究问题必须为 1-500 个字符")
+        selected = []
+        for raw in selection if isinstance(selection, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                entry = {"run_id": str(raw.get("run_id") or ""),
+                         "index": int(raw.get("index"))}
+            except (TypeError, ValueError):
+                continue
+            if entry["run_id"] and entry not in selected:
+                selected.append(entry)
+        papers = self._library_selected_papers(selected)
+        if not papers:
+            raise ValueError("请选择至少一篇仍存在于本地文献库的文献")
+        # Validate now for a clear UI error; persist identifiers, not full
+        # abstracts, so interrupted jobs can reconstruct the same evidence.
+        run_options = dict(options)
+        run_options["download"] = False
+        return self.submit(query, mode="library", library_selection=selected,
+                           **run_options)
+
+    def get_library_document(self, run_id: str, index: int) -> Optional[Dict[str, Any]]:
+        batch, data = self._library_manifest(run_id)
+        if batch is None:
+            return None
+        item = next((candidate for candidate in data.get("items", [])
+                     if isinstance(candidate, dict)
+                     and str(candidate.get("index", "")) == str(int(index))), None)
+        if item is None:
+            return None
+        merged = self._library_paper_data(data, item)
+        pdf = self._library_item_path(str(item.get("pdf_path") or ""), batch, {".pdf"})
+        text = self._library_item_path(str(item.get("text_path") or ""), batch, {".txt"})
+        annotations = self._read_json_object(self.annotations_path,
+                                             {"version": 1, "documents": {}})
+        key = self._library_doc_key(run_id, index)
+        document_annotations = annotations.get("documents", {}).get(key, {})
+        content = ""
+        if text is not None and text.is_file():
+            try:
+                # Keep browser response bounded. The original file remains
+                # available through the regular local-file endpoint.
+                content = text.read_text(encoding="utf-8", errors="replace")[:900_000]
+            except OSError:
+                pass
+        merged.update({
+            "run_id": run_id, "index": int(index),
+            "pdf_path": str(pdf) if pdf and pdf.is_file() else None,
+            "text_path": str(text) if text and text.is_file() else None,
+            "pdf_exists": bool(pdf and pdf.is_file()),
+            "text_exists": bool(text and text.is_file()),
+            "text_content": content,
+            "annotations": document_annotations.get("annotations", []),
+            "tags": document_annotations.get("tags", []),
+        })
+        return merged
+
+    def save_library_annotation(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        run_id = str(payload.get("run_id") or "")
+        try:
+            index = int(payload.get("index"))
+        except (TypeError, ValueError) as error:
+            raise ValueError("文献序号无效") from error
+        if self.get_library_document(run_id, index) is None:
+            raise ValueError("文献不存在或已删除")
+        quote = str(payload.get("quote") or "").strip()
+        note = str(payload.get("note") or "").strip()
+        tags = [str(tag).strip()[:32] for tag in (payload.get("tags") or [])
+                if str(tag).strip()][:12]
+        if len(quote) > 4000 or len(note) > 4000:
+            raise ValueError("高亮或批注不能超过 4000 个字符")
+        if not quote and not note and not tags:
+            raise ValueError("请先选择一段文字、输入批注或添加标签")
+        annotation_id = str(payload.get("id") or uuid.uuid4().hex[:16])
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{6,64}", annotation_id):
+            raise ValueError("批注标识无效")
+        color = str(payload.get("color") or "yellow")
+        if color not in {"yellow", "blue", "green", "pink"}:
+            color = "yellow"
+        page = payload.get("page")
+        try:
+            page_number = max(0, min(100_000, int(page))) if page not in (None, "") else None
+        except (TypeError, ValueError):
+            page_number = None
+        with self.lock:
+            store = self._read_json_object(self.annotations_path,
+                                           {"version": 1, "documents": {}})
+            documents = store.setdefault("documents", {})
+            entry = documents.setdefault(self._library_doc_key(run_id, index),
+                                         {"tags": [], "annotations": []})
+            entry["tags"] = list(dict.fromkeys(
+                [*entry.get("tags", []), *tags]))[:30]
+            record = {"id": annotation_id, "quote": quote, "note": note,
+                      "tags": tags, "color": color, "page": page_number,
+                      "created_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+            records = entry.setdefault("annotations", [])
+            existing = next((i for i, value in enumerate(records)
+                             if value.get("id") == annotation_id), None)
+            if existing is None:
+                records.append(record)
+            else:
+                records[existing] = record
+            entry["annotations"] = records[-500:]
+            self._write_json_object(self.annotations_path, store)
+        return {"annotation": record, "tags": entry["tags"]}
+
+    def delete_library_annotation(self, run_id: str, index: int,
+                                  annotation_id: str) -> bool:
+        with self.lock:
+            store = self._read_json_object(self.annotations_path,
+                                           {"version": 1, "documents": {}})
+            entry = store.get("documents", {}).get(self._library_doc_key(run_id, index))
+            if not isinstance(entry, dict):
+                return False
+            before = len(entry.get("annotations", []))
+            entry["annotations"] = [record for record in entry.get("annotations", [])
+                                    if record.get("id") != annotation_id]
+            if len(entry["annotations"]) == before:
+                return False
+            self._write_json_object(self.annotations_path, store)
+            return True
+
     def list_library(self, keyword: str = "", status: str = "all") -> Dict[str, Any]:
         """汇总所有下载资料包，兼容旧版 metadata.json。"""
         root = self.data_dir
@@ -1495,17 +3009,28 @@ class ResearchWebApp:
 
         manifests = sorted(root.glob("*/metadata.json"),
                            key=lambda p: p.stat().st_mtime, reverse=True)[:200]
+        manifest_data: Dict[Path, Dict[str, Any]] = {}
+        title_counts: Dict[str, int] = {}
         for manifest_path in manifests:
-            try:
-                data = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, TypeError):
+            data = self._read_json_object(manifest_path)
+            manifest_data[manifest_path] = data
+            for raw_item in data.get("items", []):
+                if isinstance(raw_item, dict):
+                    key = self._title_key(raw_item.get("title"))
+                    if key:
+                        title_counts[key] = title_counts.get(key, 0) + 1
+        for manifest_path in manifests:
+            data = manifest_data.get(manifest_path, {})
+            if not data:
                 continue
             batch_dir = manifest_path.parent.resolve()
+            batch_query = str(data.get("query") or
+                              (data.get("settings") or {}).get("query") or "")
             items = []
             for raw_item in data.get("items", []):
                 if not isinstance(raw_item, dict):
                     continue
-                item = dict(raw_item)
+                item = self._library_paper_data(data, raw_item)
                 pdf = self._library_item_path(
                     str(item.get("pdf_path") or ""), batch_dir, {".pdf"})
                 text = self._library_item_path(
@@ -1529,6 +3054,11 @@ class ResearchWebApp:
                     "text_exists": text_exists,
                     "size_bytes": pdf.stat().st_size if pdf_exists else 0,
                 })
+                item["quality"] = self._score_library_item(
+                    item,
+                    duplicate_count=title_counts.get(
+                        self._title_key(item.get("title")), 1),
+                    batch_query=batch_query)
                 items.append(item)
 
             # 搜索或筛选时不显示完全没有匹配项的批次。
@@ -1621,16 +3151,144 @@ class ResearchWebApp:
     def _report_path(self, raw: str) -> Optional[Path]:
         return self._download_path(raw, {".md"})
 
+    def _report_version_key(self, path: Path) -> str:
+        try:
+            relative = str(path.resolve().relative_to(self.data_dir.resolve()))
+        except (OSError, ValueError):
+            relative = str(path.resolve())
+        return hashlib.sha256(relative.encode("utf-8")).hexdigest()[:20]
+
+    def _report_versions_store(self) -> Dict[str, Any]:
+        return self._read_json_object(self.report_versions_path,
+                                      {"version": 1, "reports": {}})
+
+    def _create_report_version_path(self, path: Path, *, label: str = "手动快照"
+                                    ) -> Optional[Dict[str, Any]]:
+        """Snapshot a local Markdown report atomically, keeping at most 40."""
+        try:
+            path = path.resolve()
+            path.relative_to(self.data_dir.resolve())
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            return None
+        if path.suffix.lower() != ".md":
+            return None
+        with self.lock:
+            store = self._report_versions_store()
+            reports = store.setdefault("reports", {})
+            key = self._report_version_key(path)
+            records = reports.setdefault(key, [])
+            # Avoid duplicate snapshots when a runner repeats its completion
+            # callback for the same byte-identical report within a minute.
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if records and records[-1].get("sha256") == digest:
+                return dict(records[-1])
+            version_id = uuid.uuid4().hex[:16]
+            directory = self.report_versions_dir / key
+            directory.mkdir(parents=True, exist_ok=True)
+            snapshot = directory / f"{time.strftime('%Y%m%d_%H%M%S')}_{version_id}.md"
+            snapshot.write_text(content, encoding="utf-8")
+            record = {"id": version_id, "path": str(path),
+                      "name": path.name, "label": str(label or "手动快照")[:120],
+                      "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                      "sha256": digest, "size": len(content),
+                      "snapshot": str(snapshot)}
+            records.append(record)
+            stale = records[:-40]
+            reports[key] = records[-40:]
+            for old in stale:
+                old_path = self._download_path(str(old.get("snapshot") or ""), {".md"})
+                if old_path is not None:
+                    try:
+                        old_path.unlink()
+                    except OSError:
+                        pass
+            self._write_json_object(self.report_versions_path, store)
+            return dict(record)
+
+    def list_report_versions(self, raw: str) -> List[Dict[str, Any]]:
+        path = self._report_path(unquote(raw))
+        if path is None:
+            return []
+        store = self._report_versions_store()
+        records = store.get("reports", {}).get(self._report_version_key(path), [])
+        if not isinstance(records, list):
+            return []
+        result = []
+        for record in reversed(records):
+            if not isinstance(record, dict):
+                continue
+            # Public data intentionally does not contain the snapshots' local
+            # absolute path.
+            result.append({key: record.get(key) for key in
+                           ("id", "label", "created_at", "size")})
+        return result
+
+    def create_report_version(self, raw: str, label: str = "手动快照"
+                              ) -> Optional[Dict[str, Any]]:
+        path = self._report_path(unquote(raw))
+        if path is None or not path.is_file():
+            return None
+        record = self._create_report_version_path(path, label=label)
+        if record is None:
+            return None
+        return {key: record.get(key) for key in ("id", "label", "created_at", "size")}
+
+    def restore_report_version(self, raw: str, version_id: str) -> bool:
+        path = self._report_path(unquote(raw))
+        if path is None or not path.is_file():
+            return False
+        with self.lock:
+            store = self._report_versions_store()
+            records = store.get("reports", {}).get(self._report_version_key(path), [])
+            record = next((item for item in records if isinstance(item, dict)
+                           and item.get("id") == version_id), None)
+            snapshot = self._download_path(str((record or {}).get("snapshot") or ""), {".md"})
+            if snapshot is None or not snapshot.is_file():
+                return False
+            # Preserve the current version before an intentional overwrite.
+            self._create_report_version_path(path, label="恢复前自动备份")
+            try:
+                path.write_text(snapshot.read_text(encoding="utf-8", errors="replace"),
+                                encoding="utf-8")
+                return True
+            except OSError:
+                return False
+
+    def export_report(self, raw: str, fmt: str) -> Optional[Path]:
+        path = self._report_path(unquote(raw))
+        if path is None or not path.is_file():
+            return None
+        fmt = str(fmt or "").casefold()
+        extensions = {"markdown": ".md", "md": ".md", "docx": ".docx", "pdf": ".pdf"}
+        extension = extensions.get(fmt)
+        if extension is None:
+            raise ValueError("导出格式仅支持 Markdown、Word 或 PDF")
+        content = _upgrade_legacy_report_content(
+            path.read_text(encoding="utf-8", errors="replace"))
+        target = self.exports_dir / export_name(path.stem, extension)
+        if extension == ".md":
+            self.exports_dir.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        elif extension == ".docx":
+            export_docx(content, path.stem, target)
+        else:
+            export_pdf(content, path.stem, target)
+        return target
+
     def list_reports(self) -> List[Dict[str, Any]]:
         root = self.data_dir
         if not root.exists():
             return []
+        versions = self._report_versions_store().get("reports", {})
         reports = []
         for path in root.glob("*.md"):
             reports.append({"path": str(path), "name": path.name,
                             "modified": time.strftime(
                                 "%Y-%m-%d %H:%M:%S",
-                                time.localtime(path.stat().st_mtime))})
+                                time.localtime(path.stat().st_mtime)),
+                            "version_count": len(versions.get(
+                                self._report_version_key(path), []))})
         # The browser handles incremental rendering.  Returning the complete
         # metadata list keeps older reports reachable instead of silently
         # hiding everything after the first 100 files.
@@ -1650,7 +3308,15 @@ class ResearchWebApp:
         if path is None or not path.exists():
             return False
         try:
+            key = self._report_version_key(path)
             path.unlink()
+            with self.lock:
+                store = self._report_versions_store()
+                if store.get("reports", {}).pop(key, None) is not None:
+                    self._write_json_object(self.report_versions_path, store)
+                version_dir = self.report_versions_dir / key
+                if version_dir.is_dir():
+                    shutil.rmtree(version_dir)
             return True
         except OSError:
             return False
@@ -1674,13 +3340,22 @@ class ResearchWebApp:
                 self.end_headers()
                 self.wfile.write(data)
 
-            def _send_file(self, path: Path) -> None:
-                ctype = ("application/pdf" if path.suffix.lower() == ".pdf"
-                         else "text/plain; charset=utf-8")
+            def _send_file(self, path: Path, *, attachment: bool = False) -> None:
+                ctype = ({".pdf": "application/pdf", ".png": "image/png",
+                          ".svg": "image/svg+xml; charset=utf-8",
+                          ".css": "text/css; charset=utf-8",
+                          ".js": "text/javascript; charset=utf-8",
+                          ".json": "application/json; charset=utf-8",
+                          ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                          ".md": "text/markdown; charset=utf-8"}.get(
+                             path.suffix.lower(), "text/plain; charset=utf-8"))
                 self.send_response(200)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(path.stat().st_size))
-                self.send_header("Content-Disposition", "inline")
+                disposition = "attachment" if attachment else "inline"
+                filename = re.sub(r"[\r\n\\\"]", "_", path.name)
+                self.send_header("Content-Disposition",
+                                 f'{disposition}; filename="{filename}"')
                 self.end_headers()
                 with path.open("rb") as fh:
                     while True:
@@ -1708,8 +3383,25 @@ class ResearchWebApp:
                     self._send(403, json.dumps({"error": "MCP control forbidden"}))
                     return
                 if path == "/":
-                    page = _load_index_html() or _PAGE
-                    self._send(200, page, "text/html; charset=utf-8")
+                    page = _load_index_html()
+                    if page is None:
+                        self._send(
+                            500,
+                            "<!doctype html><meta charset='utf-8'>"
+                            "<title>Paper Studio</title>"
+                            "<h1>Paper Studio 界面资源缺失</h1>"
+                            "<p>请重新安装应用或检查 agent/static/index.html。</p>",
+                            "text/html; charset=utf-8",
+                        )
+                    else:
+                        self._send(200, page, "text/html; charset=utf-8")
+                elif path in {"/assets/paper-studio-logo.png",
+                               "/assets/ui-v2.css", "/assets/ui-v2.js"}:
+                    asset = _STATIC_DIR / path.lstrip("/")
+                    if asset.is_file():
+                        self._send_file(asset)
+                    else:
+                        self._send(404, json.dumps({"error": "asset not found"}))
                 elif path == "/favicon.ico":
                     # 避免浏览器把没有图标当成应用错误上报。
                     self._send(204, "", "image/x-icon")
@@ -1717,11 +3409,15 @@ class ResearchWebApp:
                     self._send(200, json.dumps(
                         app.list_jobs(), ensure_ascii=False))
                 elif path == "/api/memory":
-                    keyword = parse_qs(urlparse(self.path).query).get(
-                        "keyword", [""])[0]
+                    params = parse_qs(urlparse(self.path).query)
+                    keyword = params.get("keyword", [""])[0]
+                    include_archived = str(params.get("archived", ["1"])[0]).lower() \
+                        not in {"0", "false", "no"}
                     memory = app.memory.stats()
                     memory["keyword"] = keyword
-                    memory["items"] = app.memory.list_entries(keyword)
+                    memory["include_archived"] = include_archived
+                    memory["items"] = app.memory.list_entries(
+                        keyword, include_archived=include_archived)
                     self._send(200, json.dumps(memory, ensure_ascii=False))
                 elif path == "/api/memory-entry":
                     query = parse_qs(urlparse(self.path).query).get("query", [""])[0]
@@ -1730,9 +3426,51 @@ class ResearchWebApp:
                         self._send(404, json.dumps({"error": "memory entry not found"}))
                     else:
                         self._send(200, json.dumps(entry, ensure_ascii=False))
+                elif path == "/api/memory-graph":
+                    params = parse_qs(urlparse(self.path).query)
+                    graph = app.memory.knowledge_graph(
+                        params.get("query", [""])[0],
+                        include_archived=str(params.get("archived", ["0"])[0]).lower()
+                        in {"1", "true", "yes"})
+                    self._send(200, json.dumps(graph, ensure_ascii=False))
+                elif path == "/api/memory-export":
+                    params = parse_qs(urlparse(self.path).query)
+                    try:
+                        exported = app.export_memory(params.get("format", ["markdown"])[0])
+                    except ValueError as err:
+                        self._send(400, json.dumps({"error": str(err)}, ensure_ascii=False))
+                        return
+                    if exported is None:
+                        self._send(500, json.dumps({"error": "记忆导出失败"}, ensure_ascii=False))
+                    else:
+                        self._send_file(exported, attachment=True)
+                elif path == "/api/provider-presets":
+                    self._send(200, json.dumps(
+                        app.provider_presets_view(), ensure_ascii=False))
+                elif path == "/api/provider-quick-add":
+                    pid = str(payload.get("provider_id") or "").strip()
+                    if not pid:
+                        self._send(400, json.dumps(
+                            {"error": "provider_id 必填"},
+                            ensure_ascii=False))
+                        return
+                    try:
+                        result = app.provider_quick_add(pid)
+                    except ValueError as err:
+                        self._send(404, json.dumps(
+                            {"error": str(err)}, ensure_ascii=False))
+                        return
+                    self._send(200, json.dumps(result, ensure_ascii=False))
                 elif path == "/api/provider":
                     try:
-                        st = app.provider_status()
+                        query = parse_qs(urlparse(self.path).query)
+                        requested = query.get("id", [None])[0]
+                        check_model = (query.get("model", [""])[0]
+                                       or "").strip() or None
+                        verify = str(query.get("verify", [""])[0]).lower() in {
+                            "1", "true", "yes"}
+                        st = app.provider_status(
+                            requested, model=check_model, verify=verify)
                     except Exception:  # noqa: BLE001
                         st = {"provider": "unknown", "available": False,
                               "reason": "检测失败"}
@@ -1776,20 +3514,73 @@ class ResearchWebApp:
                 elif path == "/api/settings":
                     self._send(200, json.dumps(
                         app.public_settings(), ensure_ascii=False))
+                elif path == "/api/model-config":
+                    self._send(200, json.dumps(
+                        app.model_config_view(), ensure_ascii=False))
                 elif path == "/api/about":
                     self._send(200, json.dumps({
-                        "name": "Paper Studio", "version": APP_VERSION,
+                        "name": "Paper Studio",
+                        "version": APP_VERSION,
                         "role": "server_and_client",
+                        "build_time": "2026-09-05",
+                        "stats": {
+                            "skills": len(app.skill_catalog().get("skills", [])),
+                            "agent_roles": len(app.agent_roles_catalog().get("roles", [])),
+                            "datasources": len(app.datasource_catalog().get("connectors", [])),
+                            "mcp_tools": app.mcp_server_info().get("tool_count", 0),
+                        },
+                        "skill_categories": {
+                            "research": ["arxiv_search", "scholar_search", "citation",
+                                         "citation_analyze", "citation_scraper",
+                                         "downloader", "library_rag", "paper_summarize",
+                                         "paper_summarize_batch", "paper_compare",
+                                         "report_write", "report_render",
+                                         "research_template_compare"],
+                            "memory": ["memory_read", "memory_write", "memory_search",
+                                       "memory_archive", "memory_cleanup", "memory_clear",
+                                       "memory_delete", "memory_expiry", "memory_export",
+                                       "memory_graph", "memory_merge", "memory_pin",
+                                       "memory_stats"],
+                            "infrastructure": ["mcp_health_audit"],
+                        },
+                        "capabilities": [
+                            {"id": "agent", "icon": "✦", "name": "Agent 研究工作流",
+                             "summary": "4 个 Agent 角色 × 30 个 Skill,自适应多轮研究、对比与结构化报告。",
+                             "highlights": ["自适应多轮", "任务控制", "多主题对比", "结构化报告"]},
+                            {"id": "providers", "icon": "◫", "name": "多模型服务商模板市场",
+                             "summary": "内置 OpenAI/Anthropic/DeepSeek/通义千问等 10+ 预设,可一键添加任意 OpenAI 兼容服务。",
+                             "highlights": ["10+ 预设服务商", "任意 OpenAI 兼容", "主备模型自动切换"]},
+                            {"id": "mcp", "icon": "⮒", "name": "MCP 双角色 + 健康审计",
+                             "summary": "18 个 MCP 工具,同时承担 Server/Client 双角色;支持工具导入导出与健康审计。",
+                             "highlights": ["Server 模式", "Client 模式", "健康审计", "导入导出"]},
+                            {"id": "datasources", "icon": "⎙", "name": "外部数据源连接器",
+                             "summary": "4 种连接器接入 Zotero / Obsidian / Notion / 机构知识库,补充研究上下文。",
+                             "highlights": ["Zotero", "Obsidian", "Notion", "机构知识库"]},
+                            {"id": "library", "icon": "⛬", "name": "本地文献库 + RAG",
+                             "summary": "PDF 解析、本地索引、跨文献问答,所有研究资料保存在本机。",
+                             "highlights": ["PDF 下载", "文本抽取", "本地索引", "RAG 问答"]},
+                            {"id": "memory", "icon": "⌘", "name": "研究记忆与知识图谱",
+                             "summary": "30 个记忆 Skill,自动归档主题/论文/方法/结论,可视化知识图谱。",
+                             "highlights": ["主题/方法/结论", "知识图谱", "导出/导入", "过期清理"]},
+                        ],
                     }, ensure_ascii=False))
                 elif path == "/api/skills":
                     self._send(200, json.dumps(
                         app.skill_catalog(), ensure_ascii=False))
+                elif path == "/api/agent-roles":
+                    self._send(200, json.dumps(
+                        app.agent_roles_catalog(), ensure_ascii=False))
+                elif path == "/api/datasources":
+                    self._send(200, json.dumps(
+                        app.datasource_catalog(), ensure_ascii=False))
                 elif path == "/api/mcp-server/info":
                     self._send(200, json.dumps(
                         app.mcp_server_info(), ensure_ascii=False))
                 elif path == "/api/models":
-                    self._send(200, json.dumps(app.ollama_models(),
-                                               ensure_ascii=False))
+                    requested = parse_qs(urlparse(self.path).query).get(
+                        "provider", [None])[0]
+                    self._send(200, json.dumps(
+                        app.provider_models(requested), ensure_ascii=False))
                 elif path == "/api/schedules":
                     self._send(200, json.dumps(app.list_schedules(),
                                                ensure_ascii=False))
@@ -1809,6 +3600,18 @@ class ResearchWebApp:
                         self._send(404, json.dumps({"error": "file not found"}))
                     else:
                         self._send_file(file_path)
+                elif path == "/api/library-document":
+                    params = parse_qs(urlparse(self.path).query)
+                    try:
+                        document = app.get_library_document(
+                            params.get("run_id", [""])[0],
+                            int(params.get("index", [""])[0]))
+                    except (TypeError, ValueError):
+                        document = None
+                    if document is None:
+                        self._send(404, json.dumps({"error": "document not found"}))
+                    else:
+                        self._send(200, json.dumps(document, ensure_ascii=False))
                 elif path == "/api/report":
                     raw = parse_qs(urlparse(self.path).query).get("path", [""])[0]
                     report = app.read_report(raw)
@@ -1816,6 +3619,23 @@ class ResearchWebApp:
                         self._send(404, json.dumps({"error": "report not found"}))
                     else:
                         self._send(200, json.dumps(report, ensure_ascii=False))
+                elif path == "/api/report-versions":
+                    raw = parse_qs(urlparse(self.path).query).get("path", [""])[0]
+                    self._send(200, json.dumps(
+                        app.list_report_versions(raw), ensure_ascii=False))
+                elif path == "/api/report-export":
+                    params = parse_qs(urlparse(self.path).query)
+                    try:
+                        exported = app.export_report(
+                            params.get("path", [""])[0],
+                            params.get("format", [""])[0])
+                    except (TypeError, ValueError, RuntimeError) as err:
+                        self._send(400, json.dumps({"error": str(err)}, ensure_ascii=False))
+                        return
+                    if exported is None:
+                        self._send(404, json.dumps({"error": "report not found"}))
+                    else:
+                        self._send_file(exported, attachment=True)
                 elif path == "/api/job":
                     jid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
                     job = app.get_job(jid)
@@ -1865,6 +3685,56 @@ class ResearchWebApp:
                     self._send(400, json.dumps({
                         "error": "JSON body 必须是对象"}, ensure_ascii=False))
                     return
+                if path == "/api/datasource-configure":
+                    cid = str(payload.get("connector_id") or "").strip()
+                    cfg = payload.get("config") or {}
+                    if not isinstance(cfg, dict):
+                        self._send(400, json.dumps(
+                            {"error": "config 必须是 JSON 对象"},
+                            ensure_ascii=False))
+                        return
+                    try:
+                        result = app.datasource_configure(cid, cfg)
+                    except ValueError as err:
+                        self._send(400, json.dumps(
+                            {"error": str(err)}, ensure_ascii=False))
+                        return
+                    self._send(200, json.dumps(result, ensure_ascii=False))
+                    return
+                if path == "/api/datasource-search":
+                    cid = str(payload.get("connector_id") or "").strip()
+                    query = str(payload.get("query") or "").strip()
+                    limit = int(payload.get("limit") or 10)
+                    self._send(200, json.dumps(
+                        app.datasource_search(cid, query, limit=limit),
+                        ensure_ascii=False))
+                    return
+                if path == "/api/datasource-fetch":
+                    cid = str(payload.get("connector_id") or "").strip()
+                    target = str(payload.get("target") or "").strip()
+                    self._send(200, json.dumps(
+                        app.datasource_fetch(cid, target), ensure_ascii=False))
+                    return
+                if path == "/api/datasource-health":
+                    cid = str(payload.get("connector_id") or "").strip()
+                    self._send(200, json.dumps(
+                        app.datasource_health(cid), ensure_ascii=False))
+                    return
+                if path == "/api/provider-quick-add":
+                    pid = str(payload.get("provider_id") or "").strip()
+                    if not pid:
+                        self._send(400, json.dumps(
+                            {"error": "provider_id 必填"},
+                            ensure_ascii=False))
+                        return
+                    try:
+                        result = app.provider_quick_add(pid)
+                    except ValueError as err:
+                        self._send(404, json.dumps(
+                            {"error": str(err)}, ensure_ascii=False))
+                        return
+                    self._send(200, json.dumps(result, ensure_ascii=False))
+                    return
 
                 def bounded_int(name: str, default: int,
                                 minimum: int, maximum: int) -> int:
@@ -1903,7 +3773,9 @@ class ResearchWebApp:
                         max_downloads = max(
                             1, min(50, int(payload["max_downloads"])))
                     provider = str(payload.get("provider") or "auto")
-                    if provider not in {"auto", "ollama", "deepseek"}:
+                    provider_ids = {str(item.get("id")) for item in
+                                    app.settings.get("provider_profiles", [])}
+                    if provider not in provider_ids | {"auto"}:
                         raise ValueError("provider 不受支持")
                     return {
                         "max_results": bounded_int("max_results", 10, 1, 50),
@@ -2078,6 +3950,85 @@ class ResearchWebApp:
                             str(payload.get("server_id") or "")))
                         self._send(200, json.dumps(result, ensure_ascii=False))
                     except (TypeError, ValueError, MCPClientError) as err:
+                        self._send_mcp_client_error(err)
+                    return
+                if path == "/api/mcp-client/health":
+                    try:
+                        server_id = str(payload.get("server_id") or "").strip()
+                        if server_id:
+                            result = run_async(
+                                app.mcp_clients.health_check(server_id))
+                        else:
+                            items = run_async(
+                                app.mcp_clients.health_check_all())
+                            # 同时把结果回写 store,前端无需二次拉取
+                            for it in items:
+                                app.mcp_clients.store.record_health(
+                                    it["server_id"],
+                                    ok=bool(it.get("ok")),
+                                    latency_ms=it.get("latency_ms"),
+                                    tools_count=it.get("tools_count"),
+                                    error=it.get("error"))
+                            result = {"results": items}
+                        self._send(200, json.dumps(result, ensure_ascii=False))
+                    except (TypeError, ValueError, MCPClientError) as err:
+                        self._send_mcp_client_error(err)
+                    return
+                if path == "/api/mcp-client/audit":
+                    query = parse_qs(urlparse(self.path).query)
+                    server_id = (query.get("server_id", [""])[0] or "").strip()
+                    limit = int(query.get("limit", ["50"])[0] or "50")
+                    self._send(200, json.dumps({
+                        "server_id": server_id or None,
+                        "items": app.mcp_clients.store.recent_audit(
+                            server_id=server_id or None, limit=limit),
+                    }, ensure_ascii=False))
+                    return
+                if path == "/api/mcp-client/audit-clear":
+                    server_id = str(payload.get("server_id") or "").strip()
+                    removed = app.mcp_clients.store.clear_audit(
+                        server_id=server_id or None)
+                    self._send(200, json.dumps({
+                        "cleared": removed, "server_id": server_id or None,
+                    }, ensure_ascii=False))
+                    return
+                if path == "/api/mcp-client/export":
+                    include_secrets = bool(payload.get("include_secrets"))
+                    if payload and not isinstance(payload, dict):
+                        # 允许 GET 形式 → 空 payload;忽略
+                        pass
+                    body = app.mcp_clients.store.export_config(
+                        include_secrets=include_secrets)
+                    self._send(200, json.dumps(body, ensure_ascii=False))
+                    return
+                if path == "/api/mcp-client/import":
+                    overwrite = bool(payload.get("overwrite"))
+                    try:
+                        result = app.mcp_clients.store.import_config(
+                            payload.get("config") or {},
+                            overwrite=overwrite)
+                    except (TypeError, ValueError) as err:
+                        self._send(400, json.dumps(
+                            {"error": str(err)}, ensure_ascii=False))
+                        return
+                    self._send(200, json.dumps(result, ensure_ascii=False))
+                    return
+                if path == "/api/mcp-client/call":
+                    server_id = str(payload.get("server_id") or "").strip()
+                    tool_name = str(payload.get("tool") or "").strip()
+                    arguments = payload.get("arguments") or {}
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    token = str(payload.get("permission_token") or "")
+                    try:
+                        if token:
+                            app.mcp_permissions.consume(
+                                token, "call_tool", server_id, tool_name)
+                        result = app.mcp_clients.call_tool_with_audit(
+                            server_id, tool_name, arguments,
+                            permission_token=token or None)
+                        self._send(200, json.dumps(result, ensure_ascii=False))
+                    except (TypeError, ValueError, MCPClientError) as err:
                         self._send_mcp_client_error(err, 502)
                     return
                 if path == "/api/mcp-client/resource-read":
@@ -2163,51 +4114,20 @@ class ResearchWebApp:
                     return
 
                 if path == "/api/settings":
-                    for k in ("provider", "model", "budget_cny", "llm_timeout", "api_key",
-                              "download_interval", "download_retries", "download_timeout",
-                              "ollama_base_url", "deepseek_base_url"):
-                        if k in payload:
-                            app.settings[k] = payload[k]
-                    if app.settings.get("provider") not in (
-                            "auto", "ollama", "deepseek"):
-                        app.settings["provider"] = "auto"
                     try:
-                        budget = app.settings.get("budget_cny")
-                        app.settings["budget_cny"] = (
-                            None if budget in (None, "") else max(0, float(budget)))
-                    except (TypeError, ValueError):
-                        app.settings["budget_cny"] = None
+                        settings = app.update_settings(payload)
+                        self._send(200, json.dumps(settings, ensure_ascii=False))
+                    except (TypeError, ValueError) as err:
+                        self._send(400, json.dumps(
+                            {"error": str(err)}, ensure_ascii=False))
+                    return
+                if path == "/api/provider-test":
                     try:
-                        app.settings["llm_timeout"] = max(
-                            10, min(600, int(app.settings.get("llm_timeout") or 90)))
-                    except (TypeError, ValueError):
-                        app.settings["llm_timeout"] = 90
-                    try:
-                        app.settings["download_interval"] = max(
-                            0.5, min(30.0, float(
-                                app.settings.get("download_interval") or 2.0)))
-                    except (TypeError, ValueError):
-                        app.settings["download_interval"] = 2.0
-                    try:
-                        app.settings["download_retries"] = max(
-                            0, min(8, int(app.settings.get("download_retries") or 4)))
-                    except (TypeError, ValueError):
-                        app.settings["download_retries"] = 4
-                    try:
-                        app.settings["download_timeout"] = max(
-                            30, min(600, int(app.settings.get("download_timeout") or 90)))
-                    except (TypeError, ValueError):
-                        app.settings["download_timeout"] = 90
-                    for endpoint in ("ollama_base_url", "deepseek_base_url"):
-                        value = str(app.settings.get(endpoint) or "").strip()
-                        if not value.startswith(("http://", "https://")):
-                            value = ("http://localhost:11434" if endpoint == "ollama_base_url"
-                                     else "https://api.deepseek.com")
-                        app.settings[endpoint] = value.rstrip("/")
-                    app.tracker.set_budget(app.settings.get("budget_cny"))
-                    app._save_settings()
-                    self._send(200, json.dumps(app.public_settings(),
-                                               ensure_ascii=False))
+                        result = app.test_provider_config(payload)
+                        self._send(200, json.dumps(result, ensure_ascii=False))
+                    except (TypeError, ValueError) as err:
+                        self._send(400, json.dumps(
+                            {"error": str(err)}, ensure_ascii=False))
                     return
                 if path == "/api/job-control":
                     job = app.control_job(str(payload.get("id") or ""),
@@ -2216,6 +4136,21 @@ class ResearchWebApp:
                         self._send(404, json.dumps({"error": "job not found"}))
                     else:
                         self._send(200, json.dumps(job, ensure_ascii=False))
+                    return
+                if path == "/api/job-intervention":
+                    try:
+                        job = app.update_job_intervention(
+                            str(payload.get("id") or ""), payload)
+                        self._send(200, json.dumps(job, ensure_ascii=False))
+                    except LookupError as err:
+                        self._send(404, json.dumps({"error": str(err)},
+                                                  ensure_ascii=False))
+                    except RuntimeError as err:
+                        self._send(409, json.dumps({"error": str(err)},
+                                                  ensure_ascii=False))
+                    except (TypeError, ValueError) as err:
+                        self._send(400, json.dumps({"error": str(err)},
+                                                  ensure_ascii=False))
                     return
                 if path == "/api/job-delete":
                     outcome = app.delete_job(str(payload.get("id") or ""))
@@ -2250,9 +4185,100 @@ class ResearchWebApp:
                         str(payload.get("run_id") or ""))
                     self._send(200 if ok else 404, json.dumps({"ok": ok}))
                     return
+                if path == "/api/library-annotation":
+                    try:
+                        result = app.save_library_annotation(payload)
+                        self._send(200, json.dumps(result, ensure_ascii=False))
+                    except (TypeError, ValueError) as err:
+                        self._send(400, json.dumps({"error": str(err)}, ensure_ascii=False))
+                    return
+                if path == "/api/library-annotation-delete":
+                    try:
+                        ok = app.delete_library_annotation(
+                            str(payload.get("run_id") or ""),
+                            int(payload.get("index")),
+                            str(payload.get("id") or ""))
+                    except (TypeError, ValueError):
+                        ok = False
+                    self._send(200 if ok else 404, json.dumps({"ok": ok}))
+                    return
+                if path == "/api/library-continue":
+                    try:
+                        options = research_options()
+                        options["download"] = False
+                        job_id = app.submit_library_research(
+                            str(payload.get("query") or ""),
+                            payload.get("selection"), **options)
+                        self._send(200, json.dumps({"job_id": job_id}, ensure_ascii=False))
+                    except (TypeError, ValueError) as err:
+                        self._send(400, json.dumps({"error": str(err)}, ensure_ascii=False))
+                    return
                 if path == "/api/memory-delete":
                     ok = app.memory.delete(str(payload.get("query") or ""))
                     self._send(200 if ok else 404, json.dumps({"ok": ok}))
+                    return
+                if path == "/api/memory-pin":
+                    if not bool(payload.get("confirmed")):
+                        self._send(409, json.dumps({"error": "固定记忆需要用户确认"}, ensure_ascii=False))
+                        return
+                    entry = app.memory.set_pinned(
+                        str(payload.get("query") or ""),
+                        bool(payload.get("pinned", True)))
+                    self._send(200 if entry else 404, json.dumps(
+                        {"entry": entry} if entry else {"error": "memory entry not found"},
+                        ensure_ascii=False))
+                    return
+                if path == "/api/memory-archive":
+                    if not bool(payload.get("confirmed")):
+                        self._send(409, json.dumps({"error": "归档记忆需要用户确认"}, ensure_ascii=False))
+                        return
+                    entry = app.memory.set_archived(
+                        str(payload.get("query") or ""),
+                        bool(payload.get("archived", True)))
+                    self._send(200 if entry else 404, json.dumps(
+                        {"entry": entry} if entry else {"error": "memory entry not found"},
+                        ensure_ascii=False))
+                    return
+                if path == "/api/memory-expiry":
+                    if not bool(payload.get("confirmed")):
+                        self._send(409, json.dumps({"error": "修改记忆过期策略需要用户确认"}, ensure_ascii=False))
+                        return
+                    try:
+                        raw_days = payload.get("days")
+                        days = None if raw_days in (None, "") else int(raw_days)
+                        entry = app.memory.set_expiry(str(payload.get("query") or ""), days)
+                        self._send(200 if entry else 404, json.dumps(
+                            {"entry": entry} if entry else {"error": "memory entry not found"},
+                            ensure_ascii=False))
+                    except (TypeError, ValueError) as err:
+                        self._send(400, json.dumps({"error": str(err)}, ensure_ascii=False))
+                    return
+                if path == "/api/memory-merge":
+                    if not bool(payload.get("confirmed")):
+                        self._send(409, json.dumps({"error": "合并记忆需要用户确认"}, ensure_ascii=False))
+                        return
+                    try:
+                        sources = payload.get("source_queries") or []
+                        if not isinstance(sources, list) or len(sources) > 50:
+                            raise ValueError("source_queries 必须是不超过 50 项的数组")
+                        entry = app.memory.merge(str(payload.get("target_query") or ""),
+                                                 [str(value) for value in sources])
+                        self._send(200 if entry else 404, json.dumps(
+                            {"entry": entry} if entry else {"error": "memory entry not found"},
+                            ensure_ascii=False))
+                    except (TypeError, ValueError) as err:
+                        self._send(400, json.dumps({"error": str(err)}, ensure_ascii=False))
+                    return
+                if path == "/api/memory-cleanup":
+                    if not bool(payload.get("confirmed")):
+                        self._send(409, json.dumps({"error": "清理记忆需要用户确认"}, ensure_ascii=False))
+                        return
+                    try:
+                        result = app.memory.cleanup_expired(
+                            int(payload.get("max_age_days", 180)))
+                        self._send(200, json.dumps(result, ensure_ascii=False))
+                    except (TypeError, ValueError) as err:
+                        self._send(400, json.dumps({"error": str(err)}, ensure_ascii=False))
                     return
                 if path == "/api/memory-clear":
                     count = app.memory.clear()
@@ -2280,6 +4306,20 @@ class ResearchWebApp:
                     ok = app.delete_report(str(payload.get("path") or ""))
                     self._send(200 if ok else 404, json.dumps({"ok": ok}))
                     return
+                if path == "/api/report-version":
+                    result = app.create_report_version(
+                        str(payload.get("path") or ""),
+                        str(payload.get("label") or "手动快照"))
+                    self._send(200 if result else 404, json.dumps(
+                        {"version": result} if result else {"error": "report not found"},
+                        ensure_ascii=False))
+                    return
+                if path == "/api/report-version-restore":
+                    ok = app.restore_report_version(
+                        str(payload.get("path") or ""),
+                        str(payload.get("version_id") or ""))
+                    self._send(200 if ok else 404, json.dumps({"ok": ok}))
+                    return
                 if path != "/api/run":
                     self._send(404, json.dumps({"error": "not found"}))
                     return
@@ -2293,9 +4333,15 @@ class ResearchWebApp:
                         "error": "mode 仅支持 single 或 deep"},
                         ensure_ascii=False))
                     return
+                template = str(payload.get("template") or "").strip()
                 try:
-                    job_id = app.submit(
-                        query, mode=mode, **research_options())
+                    if template:
+                        # 走研究模板 Skill,模板内部决定怎么调 Agent/Comparator
+                        job_id = app.submit_template(
+                            template, query, payload)
+                    else:
+                        job_id = app.submit(
+                            query, mode=mode, **research_options())
                     self._send(200, json.dumps({"job_id": job_id}))
                 except (TypeError, ValueError) as err:
                     self._send(400, json.dumps({"error": str(err)},

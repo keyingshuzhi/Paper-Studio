@@ -6,7 +6,6 @@
  * Windows x64 在各自原生系统上生成对应的后端。
  */
 const { spawnSync } = require("child_process");
-const fs = require("fs");
 const path = require("path");
 
 const desktopDir = path.resolve(__dirname, "..");
@@ -26,20 +25,14 @@ function requireSupportedHost() {
   }
 }
 
-function pythonExecutable() {
-  return process.platform === "win32"
-    ? path.join(projectRoot, ".venv", "Scripts", "python.exe")
-    : path.join(projectRoot, ".venv", "bin", "python");
-}
-
 function main() {
   requireSupportedHost();
-  const python = pythonExecutable();
-  if (!fs.existsSync(python)) {
-    throw new Error(`未找到项目虚拟环境：${python}\n请先在项目根目录创建 .venv 并安装 requirements-build.txt。`);
-  }
-
-  const result = spawnSync(python, [
+  // uv is the only Python environment manager for this repository.  `uv run`
+  // creates/synchronizes .venv and installs the build dependency group before
+  // invoking PyInstaller, so desktop packaging never relies on a manually
+  // prepared or stale virtual environment.
+  const result = spawnSync("uv", [
+    "run", "--project", projectRoot, "--group", "build", "python",
     "-m", "PyInstaller",
     "--noconfirm", "--clean",
     "--distpath", path.join(projectRoot, "build", "backend-dist"),
@@ -53,6 +46,9 @@ function main() {
     },
     stdio: "inherit",
   });
+  if (result.error?.code === "ENOENT") {
+    throw new Error("未找到 uv。请先安装 uv（https://docs.astral.sh/uv/），然后重新执行 npm run dist。");
+  }
   if (result.error) throw result.error;
   process.exit(result.status ?? 1);
 }

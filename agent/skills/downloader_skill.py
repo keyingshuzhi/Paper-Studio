@@ -206,6 +206,33 @@ class DownloaderSkill(BaseSkill):
         return f"paper_{int(time.time())}.pdf"
 
     # ------------------------------------------------------------------
+    def extract_pages_with_offsets(self, file_path: str,
+                                   max_pages: Optional[int] = None
+                                   ) -> List[Tuple[int, str]]:
+        """按页抽取 PDF 文本,返回 ``[(page_number, text), ...]``。
+
+        页码从 1 开始;用于需要精确定位原文的 RAG / 引用场景。
+        单页抽取失败不会中断整体流程,该页将返回空字符串。
+        """
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"文件不存在: {path}")
+        if _PDF_BACKEND is None:
+            raise RuntimeError(
+                "未安装 PDF 解析库，请执行: uv sync")
+        reader = PdfReader(str(path))
+        pages = reader.pages
+        if max_pages:
+            pages = pages[:max_pages]
+        result: List[Tuple[int, str]] = []
+        for index, page in enumerate(pages, start=1):
+            try:
+                text = page.extract_text() or ""
+            except Exception:  # noqa: BLE001 - 单页失败不阻塞整体
+                text = ""
+            result.append((index, text))
+        return result
+
     def extract_text_from_pdf(self, file_path: str,
                               max_pages: Optional[int] = None) -> str:
         """从 PDF 提取纯文本。"""
@@ -214,7 +241,7 @@ class DownloaderSkill(BaseSkill):
             raise FileNotFoundError(f"文件不存在: {path}")
         if _PDF_BACKEND is None:
             raise RuntimeError(
-                "未安装 PDF 解析库，请执行: pip install pypdf")
+                "未安装 PDF 解析库，请执行: uv sync")
 
         reader = PdfReader(str(path))
         pages = reader.pages
@@ -250,3 +277,11 @@ class DownloaderSkill(BaseSkill):
         """便捷方法：抽取 + 清洗，返回 (原始文本, 清洗后文本)。"""
         raw = self.extract_text_from_pdf(file_path, max_pages)
         return raw, self.clean_text(raw)
+
+    def extract_pages_and_clean(self, file_path: str,
+                                max_pages: Optional[int] = None
+                                ) -> List[Tuple[int, str]]:
+        """按页抽取并清洗,返回 ``[(page_number, cleaned_text), ...]``。"""
+        return [(page, self.clean_text(text))
+                for page, text in self.extract_pages_with_offsets(
+                    file_path, max_pages)]

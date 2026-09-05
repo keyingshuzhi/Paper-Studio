@@ -155,9 +155,13 @@ class Reporter:
         ]
         for rec in rounds:
             indent = "  " * (rec["round"] - 1)
-            src = "用户输入" if rec["origin"] == "user" else "知识盲点"
+            src = ("用户输入" if rec["origin"] == "user" else
+                   "历史记忆" if rec["origin"] == "memory" else "知识盲点")
             lines.append(f"{indent}- **Round {rec['round']}** "
                          f"[{src}] `{rec['query']}`")
+        reuse_block = self._render_memory_reuse(meta.get("memory_reuse") or [])
+        if reuse_block:
+            lines += [""] + reuse_block
         lines += ["", "---", "", "## 汇总文献清单（跨轮去重）", "",
                   "| # | 年份 | 来源 | 标题 | 链接 |",
                   "|---|------|------|------|------|"]
@@ -357,6 +361,13 @@ class Reporter:
             lines[idx:idx] = block
 
         # 跨文献分析段（插在摘要段之前、文献清单之后）
+        reuse_block = self._render_memory_reuse(
+            analysis.get("historical_reuse", []) if isinstance(analysis, dict) else [])
+        if reuse_block:
+            idx = lines.index("## 文献智能摘要（问题 / 方法 / 贡献 / 局限）") \
+                if "## 文献智能摘要（问题 / 方法 / 贡献 / 局限）" in lines \
+                else lines.index("## 下一步建议（V2.0 能力预告）")
+            lines[idx:idx] = reuse_block
         if self._analysis_has_content(analysis):
             block = self._render_analysis(analysis)
             idx = lines.index("## 文献智能摘要（问题 / 方法 / 贡献 / 局限）") \
@@ -364,6 +375,29 @@ class Reporter:
                 else lines.index("## 下一步建议（V2.0 能力预告）")
             lines[idx:idx] = block
         return "\n".join(lines)
+
+    @staticmethod
+    def _render_memory_reuse(items: List[Dict[str, Any]]) -> List[str]:
+        """把实际复用的历史主题写进报告，保证研究过程可审计。"""
+        clean = [item for item in items if isinstance(item, dict)
+                 and str(item.get("query") or "").strip()]
+        if not clean:
+            return []
+        lines = ["---", "", "## 历史研究复用", "",
+                 "以下内容来自本地知识库，已作为本次研究的背景证据；"
+                 "结论仍需由本次文献交叉验证。", ""]
+        for item in clean[:10]:
+            score = item.get("score")
+            related = (f" · 相关度 {float(score):.0%}"
+                       if isinstance(score, (int, float)) else "")
+            lines.append(f"- **《{item.get('query')}》**{related}")
+            if item.get("conclusion"):
+                lines.append(f"  - 已有结论：{item['conclusion']}")
+            if item.get("paper_titles"):
+                lines.append("  - 关联论文：" + "；".join(
+                    str(title) for title in item["paper_titles"][:3] if title))
+        lines.append("")
+        return lines
 
     @staticmethod
     def _analysis_has_content(analysis: Optional[Dict[str, Any]]) -> bool:

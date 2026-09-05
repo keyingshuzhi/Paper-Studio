@@ -16,9 +16,17 @@ from .citation_skill import CitationSkill
 from .citation_analysis_skill import CitationAnalysisSkill
 from .downloader_skill import DownloaderSkill
 from .analysis_skill import PaperCompareSkill
+from .library_rag_skill import LibraryRagSkill
 from .memory_skill import (
+    MemoryArchiveSkill,
+    MemoryCleanupSkill,
     MemoryClearSkill,
     MemoryDeleteSkill,
+    MemoryExportSkill,
+    MemoryExpirySkill,
+    MemoryGraphSkill,
+    MemoryMergeSkill,
+    MemoryPinSkill,
     MemoryReadSkill,
     MemorySearchSkill,
     MemoryStatsSkill,
@@ -26,6 +34,11 @@ from .memory_skill import (
 )
 from .metadata import Paper
 from .report_skill import ReportRenderSkill, ReportWriteSkill
+from .research_template_skill import (
+    ResearchTemplateCompareSkill, ResearchTemplateCompetitorSkill,
+    ResearchTemplateDailySkill, ResearchTemplateOpeningSkill,
+    ResearchTemplateSurveySkill,
+)
 from .scholar_skill import ScholarSkill
 from .scraper_skill import CitationScraperSkill
 from .search_manager import SearchManager
@@ -52,12 +65,25 @@ __all__ = [
     "PaperSummarizeSkill",
     "PaperSummarizeBatchSkill",
     "PaperCompareSkill",
+    "LibraryRagSkill",
     "MemorySearchSkill",
     "MemoryReadSkill",
     "MemoryWriteSkill",
     "MemoryDeleteSkill",
     "MemoryClearSkill",
     "MemoryStatsSkill",
+    "MemoryPinSkill",
+    "MemoryArchiveSkill",
+    "MemoryExpirySkill",
+    "MemoryMergeSkill",
+    "MemoryCleanupSkill",
+    "MemoryGraphSkill",
+    "MemoryExportSkill",
     "ReportRenderSkill",
     "ReportWriteSkill",
+    "ResearchTemplateSurveySkill",
+    "ResearchTemplateCompareSkill",
+    "ResearchTemplateOpeningSkill",
+    "ResearchTemplateCompetitorSkill",
+    "ResearchTemplateDailySkill",
 ]

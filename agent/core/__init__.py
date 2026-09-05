@@ -11,6 +11,10 @@ from .llm_planner import LLMPlanner
 from .memory import ResearchMemory
 from .multi_topic import MultiTopicComparator
 from .planner import Planner, ResearchPlan
+from .provider_profiles import (DEFAULT_PROVIDER_PROFILES,
+                                default_provider_profiles,
+                                persistent_profiles, profile_by_id,
+                                sanitize_provider_profiles)
 from .reporter import Reporter
 from .research_loop import ResearchLoop
 from .summarizer import PaperSummarizer
@@ -31,6 +35,11 @@ __all__ = [
     "price_for",
     "estimate_cost_cny",
     "format_cny",
+    "DEFAULT_PROVIDER_PROFILES",
+    "default_provider_profiles",
+    "persistent_profiles",
+    "profile_by_id",
+    "sanitize_provider_profiles",
     "ResearchPlan",
     "Reporter",
     "PaperSummarizer",

@@ -196,7 +196,12 @@ def main() -> None:
            and all(cached[0]["summary"].get(key) for key in
                    ("problem", "method", "contribution",
                     "limitation", "keywords")))
-    expect("深度报告仍生成", Path(result["report_path"]).exists())
+    memory_report = Path(result["report_path"])
+    expect("深度报告仍生成", memory_report.exists())
+    memory_report_text = memory_report.read_text(encoding="utf-8")
+    expect("报告明确列出历史复用来源",
+           "## 历史研究复用" in memory_report_text
+           and "Old Mamba Paper" in memory_report_text)
 
     print("== 用例 6：记忆落盘（研究后自动保存）==")
     fake = FakeLLM([GAP_JSON, EMPTY_JSON])

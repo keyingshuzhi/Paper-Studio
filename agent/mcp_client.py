@@ -27,6 +27,7 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
 from .read_service import resolve_data_dir
+from . import __version__ as _APP_VERSION
 
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -39,6 +40,10 @@ _TRANSPORTS = frozenset({"stdio", "streamable_http"})
 _PERMISSION_OPERATIONS = frozenset({"trust", "delete", "call_tool"})
 _MAX_CONFIG_BYTES = 1024 * 1024
 _MAX_RESULT_BYTES = 2 * 1024 * 1024
+_MAX_AUDIT_RECORDS = 500  # 调用日志环形缓冲大小
+_MAX_HEALTH_RECORDS = 50   # 健康检查历史
+_HEALTH_TIMEOUT_SECONDS = 8.0
+_EXPORT_SCHEMA_VERSION = 1
 
 
 class MCPClientError(RuntimeError):
@@ -125,6 +130,8 @@ class MCPConnectionStore:
         self.path = Path(path or (resolve_data_dir() / "mcp_connections.json"))
         self._lock = threading.RLock()
         self._servers: Dict[str, Dict[str, Any]] = {}
+        self._audit_log: List[Dict[str, Any]] = []
+        self._health_log: List[Dict[str, Any]] = []
         self._load()
 
     def _load(self) -> None:
@@ -336,6 +343,153 @@ class MCPConnectionStore:
             del self._servers[server_id]
             self._persist()
             return True
+
+    # ---------------- 健康检查 ----------------
+    def record_health(self, server_id: str, *, ok: bool,
+                      latency_ms: Optional[float] = None,
+                      tools_count: Optional[int] = None,
+                      error: Optional[str] = None) -> Dict[str, Any]:
+        """记录一次健康检查结果;同时更新该 server 的 last_status 字段。"""
+        entry = {
+            "server_id": server_id,
+            "ok": bool(ok),
+            "latency_ms": round(float(latency_ms), 1) if latency_ms else None,
+            "tools_count": tools_count,
+            "error": None if ok else str(error or "")[:200],
+            "at": _now_text(),
+        }
+        with self._lock:
+            self._health_log.append(entry)
+            if len(self._health_log) > _MAX_HEALTH_RECORDS:
+                self._health_log = self._health_log[-_MAX_HEALTH_RECORDS:]
+            server = self._servers.get(server_id)
+            if server is not None:
+                server["last_status"] = "connected" if ok else "error"
+                if ok:
+                    server["last_connected_at"] = entry["at"]
+                if latency_ms is not None:
+                    server["last_latency_ms"] = entry["latency_ms"]
+                if tools_count is not None:
+                    server["last_tools_count"] = tools_count
+                server["last_error"] = None if ok else entry["error"]
+            self._persist()
+        return entry
+
+    def recent_health(self, server_id: Optional[str] = None,
+                      limit: int = 20) -> List[Dict[str, Any]]:
+        with self._lock:
+            items = self._health_log
+        if server_id:
+            items = [e for e in items if e["server_id"] == server_id]
+        return list(items[-max(1, min(_MAX_HEALTH_RECORDS, int(limit))):])
+
+    # ---------------- 调用审计 ----------------
+    def record_audit(self, server_id: str, tool: str, *,
+                     arguments: Optional[Dict[str, Any]] = None,
+                     ok: bool = True, latency_ms: Optional[float] = None,
+                     permission_token: Optional[str] = None,
+                     error: Optional[str] = None) -> Dict[str, Any]:
+        entry = {
+            "server_id": server_id, "tool": str(tool),
+            "arguments": _bounded_payload(arguments or {}),
+            "ok": bool(ok),
+            "latency_ms": round(float(latency_ms), 1) if latency_ms else None,
+            "permission_token_prefix": (permission_token or "")[:8] or None,
+            "error": None if ok else str(error or "")[:300],
+            "at": _now_text(),
+        }
+        with self._lock:
+            self._audit_log.append(entry)
+            if len(self._audit_log) > _MAX_AUDIT_RECORDS:
+                self._audit_log = self._audit_log[-_MAX_AUDIT_RECORDS:]
+        return entry
+
+    def recent_audit(self, server_id: Optional[str] = None,
+                     limit: int = 50) -> List[Dict[str, Any]]:
+        with self._lock:
+            items = self._audit_log
+        if server_id:
+            items = [e for e in items if e["server_id"] == server_id]
+        return list(items[-max(1, min(_MAX_AUDIT_RECORDS, int(limit))):])
+
+    def clear_audit(self, server_id: Optional[str] = None) -> int:
+        with self._lock:
+            before = len(self._audit_log)
+            if server_id is None:
+                self._audit_log.clear()
+            else:
+                self._audit_log = [
+                    e for e in self._audit_log if e["server_id"] != server_id]
+            return before - len(self._audit_log)
+
+    # ---------------- 配置导入导出 ----------------
+    def export_config(self, include_secrets: bool = False) -> Dict[str, Any]:
+        """导出连接清单(默认不携带环境变量名之外的敏感内容)。
+
+        ``include_secrets=False`` 时只导出 ``id/name/transport/url/env/...``;
+        ``True`` 时额外带上 ``env`` 字段,方便从一台机器迁移到另一台,但不
+        包含任何真实 API Key 值。
+        """
+        with self._lock:
+            exported = []
+            for server in self._servers.values():
+                item = {
+                    "id": server.get("id"),
+                    "name": server.get("name"),
+                    "transport": server.get("transport", "http"),
+                    "trusted": bool(server.get("trusted")),
+                    "url": server.get("url", ""),
+                    "command": server.get("command", []),
+                    "env": list(server.get("env", [])),
+                    "headers": list(server.get("headers", [])),
+                    "description": server.get("description", ""),
+                    "tags": list(server.get("tags", [])),
+                }
+                if include_secrets:
+                    item["_include_env"] = True
+                exported.append(item)
+        return {
+            "schema": _EXPORT_SCHEMA_VERSION,
+            "exported_at": _now_text(),
+            "app_version": _APP_VERSION,
+            "server_count": len(exported),
+            "servers": exported,
+        }
+
+    def import_config(self, payload: Dict[str, Any], *,
+                      overwrite: bool = False) -> Dict[str, Any]:
+        """从导出格式导入;默认跳过已存在 id,``overwrite=True`` 覆盖。"""
+        if not isinstance(payload, dict):
+            raise ValueError("导入文件不是合法 JSON 对象")
+        servers = payload.get("servers")
+        if not isinstance(servers, list):
+            raise ValueError("缺少 servers 列表")
+        added, skipped, replaced = 0, 0, 0
+        for raw in servers[:100]:
+            if not isinstance(raw, dict):
+                continue
+            sid = str(raw.get("id") or "").strip()
+            if not sid:
+                continue
+            try:
+                server = self._validate(dict(raw), existing=None)
+            except (TypeError, ValueError):
+                continue
+            with self._lock:
+                if sid in self._servers:
+                    if not overwrite:
+                        skipped += 1
+                        continue
+                    replaced += 1
+                else:
+                    added += 1
+                self._servers[sid] = server
+        with self._lock:
+            self._persist()
+        return {
+            "added": added, "skipped": skipped,
+            "replaced": replaced, "total": added + skipped + replaced,
+        }
 
 
 class MCPPermissionBroker:
@@ -610,6 +764,101 @@ class MCPClientManager:
             if isinstance(err, (ValueError, MCPClientError)):
                 raise
             raise MCPClientError(f"Prompt 获取失败：{_one_line(err)}") from err
+
+    async def health_check(self, server_id: str) -> Dict[str, Any]:
+        """Ping 一个 MCP 服务器,返回 ok/延迟/tools 数量。
+
+        失败时返回 ``{"ok": False, "error": "..."}``,不抛异常(便于 UI 批
+        量展示)。结果自动写入 store,便于审计页查询。
+        """
+        started = time.monotonic()
+        try:
+            server = self.store.get(server_id)
+        except MCPClientError as err:
+            self.store.record_health(server_id, ok=False,
+                                     latency_ms=None, error=str(err))
+            return {"ok": False, "error": str(err), "server_id": server_id,
+                    "latency_ms": None, "tools_count": None}
+        try:
+            with anyio.fail_after(_HEALTH_TIMEOUT_SECONDS):
+                async with self._client(server) as client:
+                    tools = await self._pages(client, "list_tools", "tools")
+            latency = (time.monotonic() - started) * 1000
+            result = {"ok": True, "server_id": server_id,
+                      "latency_ms": latency,
+                      "tools_count": len(tools) if isinstance(tools, list) else None,
+                      "error": None}
+            self.store.record_health(server_id, ok=True,
+                                     latency_ms=latency,
+                                     tools_count=result["tools_count"])
+            return result
+        except Exception as err:
+            latency = (time.monotonic() - started) * 1000
+            self.store.record_health(server_id, ok=False,
+                                     latency_ms=latency, error=_one_line(err))
+            return {"ok": False, "server_id": server_id,
+                    "latency_ms": latency,
+                    "tools_count": None,
+                    "error": _one_line(err)}
+
+    async def health_check_all(self) -> List[Dict[str, Any]]:
+        """对所有已配置的 server 并发执行健康检查。"""
+        ids = [s["id"] for s in self.store.list()]
+        results: List[Dict[str, Any]] = []
+        if not ids:
+            return results
+        coro_results = await asyncio.gather(
+            *(self.health_check(sid) for sid in ids),
+            return_exceptions=True)
+        for sid, item in zip(ids, coro_results):
+            if isinstance(item, Exception):
+                results.append({"ok": False, "server_id": sid,
+                                "error": _one_line(item),
+                                "latency_ms": None, "tools_count": None})
+            else:
+                results.append(item)
+        return results
+
+    def call_tool_with_audit(self, server_id: str, tool_name: str,
+                             arguments: Optional[Dict[str, Any]] = None,
+                             *, permission_token: Optional[str] = None
+                             ) -> Dict[str, Any]:
+        """同步入口:调 tool + 自动落审计 + 记健康,返回 SkillResult 同构 dict。"""
+        started = time.monotonic()
+        try:
+            raw = run_async(self.call_tool(server_id, tool_name, arguments))
+            latency = (time.monotonic() - started) * 1000
+            self.store.record_audit(server_id, tool_name,
+                                    arguments=arguments, ok=True,
+                                    latency_ms=latency,
+                                    permission_token=permission_token)
+            self.store.record_health(server_id, ok=True,
+                                     latency_ms=latency,
+                                     tools_count=self._count_tools(raw))
+            return {"ok": True, "data": raw, "latency_ms": latency}
+        except MCPClientError as err:
+            latency = (time.monotonic() - started) * 1000
+            self.store.record_audit(server_id, tool_name,
+                                    arguments=arguments, ok=False,
+                                    latency_ms=latency,
+                                    permission_token=permission_token,
+                                    error=str(err))
+            self.store.record_health(server_id, ok=False,
+                                     latency_ms=latency, error=str(err))
+            return {"ok": False, "error": str(err), "latency_ms": latency}
+
+    @staticmethod
+    def _count_tools(raw: Any) -> Optional[int]:
+        if isinstance(raw, dict):
+            data = raw.get("data")
+            if isinstance(data, list):
+                return len(data)
+            for key in ("tools", "items"):
+                if isinstance(raw.get(key), list):
+                    return len(raw[key])
+        if isinstance(raw, list):
+            return len(raw)
+        return None
 
     async def call_tool(self, server_id: str, tool_name: str,
                         arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

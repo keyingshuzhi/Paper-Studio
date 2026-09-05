@@ -26,7 +26,52 @@ function withinDownloads(targetPath, suffixes) {
 }
 
 function credentialPath() {
+  return path.join(app.getPath("userData"), "provider-secrets.bin");
+}
+
+function legacyCredentialPath() {
   return path.join(app.getPath("userData"), "deepseek-api-key.bin");
+}
+
+function loadProviderSecrets() {
+  if (!safeStorage.isEncryptionAvailable()) return {};
+  try {
+    if (fs.existsSync(credentialPath())) {
+      const parsed = JSON.parse(safeStorage.decryptString(fs.readFileSync(credentialPath())));
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") return {};
+      return Object.fromEntries(Object.entries(parsed)
+        .filter(([key, value]) => /^[a-z0-9][a-z0-9_-]{0,47}$/.test(key)
+          && typeof value === "string" && value.length <= 10000));
+    }
+    // Read the v0.0.x DeepSeek-only file until the next credentials save.
+    // saveProviderSecrets removes that obsolete encrypted file so a cleared
+    // legacy key cannot unexpectedly reappear after restart.
+    if (fs.existsSync(legacyCredentialPath())) {
+      const key = safeStorage.decryptString(fs.readFileSync(legacyCredentialPath()));
+      return key ? { deepseek: key } : {};
+    }
+  } catch {
+    return {};
+  }
+  return {};
+}
+
+function saveProviderSecrets(value) {
+  if (!safeStorage.isEncryptionAvailable() || !value
+      || Array.isArray(value) || typeof value !== "object") return false;
+  const clean = Object.fromEntries(Object.entries(value)
+    .filter(([key, secret]) => /^[a-z0-9][a-z0-9_-]{0,47}$/.test(key)
+      && typeof secret === "string" && secret.length <= 10000 && secret));
+  if (Object.keys(clean).length === 0) {
+    fs.rmSync(credentialPath(), { force: true });
+    fs.rmSync(legacyCredentialPath(), { force: true });
+    return true;
+  }
+  fs.writeFileSync(credentialPath(), safeStorage.encryptString(JSON.stringify(clean)), {
+    mode: 0o600,
+  });
+  fs.rmSync(legacyCredentialPath(), { force: true });
+  return true;
 }
 
 function projectRoot() {
@@ -47,15 +92,11 @@ function backendCommand(root) {
       args: [],
     };
   }
-  if (process.platform === "win32") {
-    return {
-      command: path.join(root, ".venv", "Scripts", "python.exe"),
-      args: ["-B", "-m", "agent.webapp"],
-    };
-  }
   return {
-    command: path.join(root, ".venv", "bin", "python"),
-    args: ["-B", "-m", "agent.webapp"],
+    // Development mode uses the same uv project environment as the CLI and
+    // packaging pipeline; it no longer assumes a manually created .venv.
+    command: process.platform === "win32" ? "uv.exe" : "uv",
+    args: ["run", "--project", root, "python", "-B", "-m", "agent.webapp"],
   };
 }
 
@@ -86,8 +127,9 @@ function launchBackend() {
     dialog.showErrorBox("Paper Studio 无法启动", message);
     app.quit();
   };
-  backend.on("error", (error) => fail(
-    `无法启动研究后端：${error.message}\n\n请重新安装 Paper Studio。`));
+  backend.on("error", (error) => fail(error.code === "ENOENT"
+    ? "未找到 uv。开发模式请先安装 uv，并在项目根目录执行 uv sync。"
+    : `无法启动研究后端：${error.message}\n\n请重新安装 Paper Studio。`));
   // StringDecoder 会保留跨 chunk 的 UTF-8 多字节字符，避免中文被
   // data.toString() 在边界上拆成替换符。
   const stdoutDecoder = new StringDecoder("utf8");
@@ -152,24 +194,15 @@ ipcMain.handle("library:open", async (_event, filePath) => {
   if (!target || !fs.existsSync(target)) return false;
   return (await shell.openPath(target)) === "";
 });
-ipcMain.handle("secret:load", () => {
-  if (!safeStorage.isEncryptionAvailable() || !fs.existsSync(credentialPath())) {
-    return null;
-  }
-  try {
-    return safeStorage.decryptString(fs.readFileSync(credentialPath()));
-  } catch {
-    return null;
-  }
-});
+ipcMain.handle("secrets:load", () => loadProviderSecrets());
+ipcMain.handle("secrets:save", (_event, value) => saveProviderSecrets(value));
+// Compatibility bridge for an already-open v0.0.x renderer during upgrade.
+ipcMain.handle("secret:load", () => loadProviderSecrets().deepseek || null);
 ipcMain.handle("secret:save", (_event, value) => {
-  if (!safeStorage.isEncryptionAvailable()) return false;
-  if (!value) {
-    fs.rmSync(credentialPath(), { force: true });
-    return true;
-  }
-  fs.writeFileSync(credentialPath(), safeStorage.encryptString(String(value)), { mode: 0o600 });
-  return true;
+  const secrets = loadProviderSecrets();
+  if (value) secrets.deepseek = String(value);
+  else delete secrets.deepseek;
+  return saveProviderSecrets(secrets);
 });
 app.on("window-all-closed", () => app.quit());
 app.on("before-quit", () => {

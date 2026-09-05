@@ -138,3 +138,38 @@ REPORT_KIND_SCHEMA: Dict[str, Any] = {
     "type": "string",
     "enum": ["single", "deep", "comparison"],
 }
+
+
+# ============================== Library RAG ================================
+
+
+LIBRARY_QA_CITATION_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": ["index", "paper_id", "paper_title", "page_start",
+                 "page_end", "quote", "score"],
+    "properties": {
+        "index": {"type": "integer", "minimum": 1},
+        "paper_id": {"type": "string", "minLength": 1},
+        "paper_title": {"type": "string", "minLength": 1},
+        "page_start": {"type": "integer", "minimum": 1},
+        "page_end": {"type": "integer", "minimum": 1},
+        "quote": {"type": "string", "minLength": 1},
+        "score": {"type": "number"},
+    },
+    "additionalProperties": True,
+}
+
+
+LIBRARY_QA_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": ["answer", "citations"],
+    "properties": {
+        "answer": {"type": "string", "minLength": 1},
+        "citations": {
+            "type": "array",
+            "items": LIBRARY_QA_CITATION_SCHEMA,
+        },
+        "hits": {"type": "array", "items": {"type": "object"}},
+    },
+    "additionalProperties": True,
+}

@@ -63,12 +63,15 @@ def main() -> None:
     expect("新增工作区和交互状态均有浅色覆盖",
            all(f'html[data-theme="light"] {selector}' in final_css
                for selector in required))
-    expect("成本图表根据主题选择文字和网格色",
-           'dataset.theme==="light"' in HTML and
-           'grid:"#d6e0ea"' in HTML and
-           '__paperStudioCostEntries' in HTML)
-    expect("系统主题切换会重绘成本图表",
-           'requestAnimationFrame(()=>drawCostChart' in HTML)
+    expect("成本页面和运行脚本已从新版工作台移除",
+           'data-p="cost"' not in HTML and 'id="p-cost"' not in HTML and
+           '/api/cost' not in HTML and 'drawCostChart' not in HTML)
+    expect("多服务商交互具备浅色主题覆盖",
+           all(f'html[data-theme="light"] {selector}' in final_css
+               for selector in (
+                   '.active-provider-row', '.provider-profile',
+                   '.provider-profile.selected', '.provider-avatar',
+                   '.provider-status.ready', '.provider-empty')))
     print("\n浅色主题用例全部通过 ✅")
 
 

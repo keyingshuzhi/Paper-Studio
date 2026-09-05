@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -33,6 +34,7 @@ def fake_runner(query, **opts):
 
 
 def main() -> None:
+    root = Path(tempfile.mkdtemp())
     print("== 用例 0：历史报告读取迁移 ==")
     legacy = """## 文献智能摘要（问题 / 方法 / 贡献 / 局限）
 
@@ -56,7 +58,8 @@ def main() -> None:
            and "限流或缺少 ID" not in upgraded)
 
     print("== 用例 1：任务生命周期（直连 API）==")
-    app = ResearchWebApp(runner=fake_runner)
+    app = ResearchWebApp(runner=fake_runner,
+                         jobs_path=str(root / "jobs-lifecycle.json"))
     jid = app.submit("mamba", mode="deep", max_results=3)
     expect("专业任务 ID 格式", bool(re.fullmatch(
         r"research-\d{8}T\d{6}-[0-9a-f]{8}", jid)))
@@ -83,7 +86,8 @@ def main() -> None:
     def bad_runner(query, **opts):
         print("准备失败")
         raise RuntimeError("模拟失败")
-    app2 = ResearchWebApp(runner=bad_runner)
+    app2 = ResearchWebApp(runner=bad_runner,
+                          jobs_path=str(root / "jobs-error.json"))
     jid2 = app2.submit("x")
     for _ in range(50):
         job2 = app2.get_job(jid2)
@@ -94,7 +98,8 @@ def main() -> None:
     expect("错误信息", "模拟失败" in job2["error"])
 
     print("== 用例 4：HTTP 冒烟（ephemeral 端口）==")
-    app3 = ResearchWebApp(runner=fake_runner)
+    app3 = ResearchWebApp(runner=fake_runner,
+                          jobs_path=str(root / "jobs-http.json"))
     server = app3._make_server(port=0)  # type: ignore[attr-defined]
     port = server.server_address[1]
     t = threading.Thread(target=server.serve_forever, daemon=True)
@@ -139,13 +144,8 @@ def main() -> None:
         library = json.loads(resp.read())
     expect("文献库接口返回", "batches" in library and "stats" in library)
 
-    # POST /api/cost-clear
-    req = urllib.request.Request(
-        f"{base}/api/cost-clear", data=b"{}",
-        headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        cleared = json.loads(resp.read())
-    expect("成本记录可清空", cleared.get("ok") is True)
+    expect("首页不再包含成本页面",
+           'data-p="cost"' not in html and 'id="p-cost"' not in html)
 
     # 等待任务完成并查日志
     for _ in range(50):

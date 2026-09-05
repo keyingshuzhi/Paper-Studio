@@ -47,6 +47,7 @@ class ResearchAgent:
             summarize_limit: Optional[int] = None,
             analyze: bool = False,
             checkpoint: Optional[Callable[[], None]] = None,
+            event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
             **overrides: Any) -> Dict[str, Any]:
         """执行一次完整的研究任务。
 
@@ -64,24 +65,106 @@ class ResearchAgent:
             {plan, papers, acquisition, summaries, analysis, report_path}
         """
         self._checkpoint(checkpoint)
-        plan: ResearchPlan = self.planner.make_plan(user_input, **overrides)
+        self._event(event_callback, "research_input", "研究输入", {
+            "query": user_input,
+            "sources": overrides.get("sources"),
+            "year_from": overrides.get("year_from"),
+            "max_results": overrides.get("max_results"),
+            "exclude_titles": list(overrides.get("exclude_titles") or []),
+            "research_direction": str(overrides.get("research_direction") or ""),
+        })
+        direction = str(overrides.get("research_direction") or "").strip()
+        historical_context = str(overrides.get("historical_context") or "").strip()
+        effective_input = user_input
+        if direction:
+            effective_input = (
+                f"{user_input}\n\n补充研究方向（需要纳入检索与分析）：{direction}")
+            self._event(event_callback, "intervention", "已应用补充方向", {
+                "research_direction": direction,
+            })
+        if historical_context:
+            # 历史内容是可复用证据，而不是新检索结果；在规划阶段明确要求模型
+            # 用本次文献交叉核验，可避免把旧结论误当作事实回声。
+            effective_input += f"\n\n历史研究复用（需交叉验证）：\n{historical_context}"
+            self._event(event_callback, "memory_reuse", "复用历史研究结论", {
+                "context_chars": len(historical_context),
+            })
+        # ``existing_papers`` is deliberately an explicit opt-in.  It lets a
+        # user continue a line of inquiry from their local library without
+        # silently mixing fresh search results into the evidence set.
+        raw_existing = overrides.get("existing_papers")
+        existing_papers: List[Paper] = []
+        if isinstance(raw_existing, list):
+            for raw in raw_existing[:50]:
+                try:
+                    existing_papers.append(
+                        raw if isinstance(raw, Paper) else Paper.from_dict(raw))
+                except (TypeError, ValueError):
+                    continue
+        if raw_existing is not None and not existing_papers:
+            raise ValueError("未找到可用于继续研究的本地文献")
+
+        plan: ResearchPlan = self.planner.make_plan(effective_input, **overrides)
+        if existing_papers:
+            # Downloading here would be surprising: these records represent a
+            # user-selected, already local collection.  Keep the source set
+            # closed and only read/compare what the user selected.
+            plan.download = False
         print(f"[规划] 模式={plan.extra.get('planner', '?')} "
               f"| 关键词={plan.query!r} | 下载={plan.download} "
               f"| 来源={plan.sources or '全部'} "
               f"| 年份>={plan.year_from or '不限'}")
+        self._event(event_callback, "plan", "检索计划", {
+            "query": plan.query,
+            "original_query": plan.original_query,
+            "sources": plan.sources,
+            "max_results": plan.max_results,
+            "year_from": plan.year_from,
+            "download": plan.download,
+            "planner": plan.extra.get("planner"),
+        })
 
-        # 1) 综合搜索（Plugins: comprehensive_search）
+        # 1) 综合搜索，或由用户明确选中的本地文献继续研究。
         self._checkpoint(checkpoint)
-        papers: List[Paper] = self.search_plugin.run(
-            query=plan.query,
-            max_results=plan.max_results,
-            sources=plan.sources,
-        )
+        if existing_papers:
+            papers = existing_papers
+            print(f"[文献库] 复用 {len(papers)} 篇已选本地文献，不重新检索")
+            self._event(event_callback, "library_evidence", "复用本地文献", {
+                "total": len(papers),
+                "papers": [paper.to_dict() for paper in papers],
+            })
+        else:
+            papers = self.search_plugin.run(
+                query=plan.query,
+                max_results=plan.max_results,
+                sources=plan.sources,
+            )
 
         # 年份过滤（LLM 解析出的 year_from）
         if plan.year_from:
             papers = [p for p in papers if (p.year or 0) >= plan.year_from]
-        print(f"[搜索] 命中 {len(papers)} 篇去重文献")
+        excluded = {
+            self._title_key(title) for title in overrides.get("exclude_titles", [])
+            if self._title_key(title)
+        }
+        if excluded:
+            before = len(papers)
+            papers = [paper for paper in papers
+                      if self._title_key(paper.title) not in excluded]
+            removed = before - len(papers)
+            if removed:
+                print(f"[人工介入] 已排除 {removed} 篇指定文献")
+                self._event(event_callback, "intervention", "已应用文献排除", {
+                    "removed": removed,
+                    "excluded_titles": list(overrides.get("exclude_titles") or []),
+                })
+        if not existing_papers:
+            print(f"[搜索] 命中 {len(papers)} 篇去重文献")
+            self._event(event_callback, "search_results", "检索结果", {
+                "query": plan.query,
+                "total": len(papers),
+                "papers": [paper.to_dict() for paper in papers],
+            })
 
         # 2) 数据获取（Plugins: data_acquisition，可选）
         acquisition: Optional[Dict[str, Any]] = None
@@ -93,19 +176,32 @@ class ResearchAgent:
                 max_downloads=plan.max_downloads,
                 delay_seconds=float(overrides.get("download_interval", 1.5)),
                 checkpoint=checkpoint)
+            self._event(event_callback, "download_result", "文献下载结果", {
+                "stats": (acquisition or {}).get("stats", {}),
+                "items": (acquisition or {}).get("items", []),
+            })
 
         # 3) 智能摘要（MCP 认知能力，可选）
         summaries: Optional[List[Dict[str, Any]]] = None
         if summarize and papers:
             self._checkpoint(checkpoint)
             summaries = self._run_summaries(papers, acquisition,
-                                            summarize_limit)
+                                            summarize_limit,
+                                            event_callback=event_callback)
 
         # 4) 跨文献分析（MCP 综述专家能力，可选）
         analysis: Optional[Dict[str, Any]] = None
         if analyze and papers:
             self._checkpoint(checkpoint)
-            analysis = self._run_analysis(papers, summaries)
+            analysis = self._run_analysis(
+                papers, summaries, event_callback=event_callback)
+
+        # 给单轮报告也留下可审计的复用来源。深度报告由 ResearchLoop 在
+        # meta 中单独呈现，二者共用相同的数据结构。
+        historical_reuse = overrides.get("historical_reuse") or []
+        if isinstance(historical_reuse, list) and historical_reuse:
+            analysis = dict(analysis or {})
+            analysis["historical_reuse"] = historical_reuse
 
         # 5) 报告生成（MCP 输出）
         report_path = None
@@ -114,6 +210,9 @@ class ResearchAgent:
             report_path = self.reporter.write(
                 plan, papers, acquisition, summaries, analysis)
             print(f"[报告] 已生成: {report_path}")
+            self._event(event_callback, "report", "报告已生成", {
+                "report_path": str(report_path),
+            })
 
         return {
             "plan": plan,
@@ -131,10 +230,28 @@ class ResearchAgent:
         if checkpoint is not None:
             checkpoint()
 
+    @staticmethod
+    def _title_key(title: Any) -> str:
+        return " ".join(str(title or "").casefold().split())
+
+    @staticmethod
+    def _event(callback: Optional[Callable[[Dict[str, Any]], None]],
+               kind: str, title: str, data: Dict[str, Any]) -> None:
+        """Emit inspectable workflow data without coupling core to Web UI."""
+        if callback is None:
+            return
+        try:
+            callback({"kind": kind, "title": title, "data": data})
+        except Exception:
+            # A telemetry consumer must not interrupt research execution.
+            pass
+
     # ------------------------------------------------------------------
     def _run_summaries(self, papers: List[Paper],
                        acquisition: Optional[Dict[str, Any]],
-                       limit: Optional[int]) -> List[Dict[str, Any]]:
+                       limit: Optional[int],
+                       event_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+                       ) -> List[Dict[str, Any]]:
         """为论文批量生成智能摘要。
 
         文本来源优先级：
@@ -175,6 +292,12 @@ class ResearchAgent:
         fallback = sum(1 for r in results if r.get("fallback"))
         suffix = f"（{fallback} 篇使用本地降级摘要）" if fallback else ""
         print(f"[摘要] 完成 {ok}/{len(results)} 篇{suffix}")
+        self._event(event_callback, "summary_output", "结构化摘要输出", {
+            "completed": ok,
+            "total": len(results),
+            "fallback": fallback,
+            "summaries": results,
+        })
         return results
 
     def complete_summary_records(
@@ -215,7 +338,9 @@ class ResearchAgent:
     # ------------------------------------------------------------------
     def _run_analysis(self, papers: List[Paper],
                       summaries: Optional[List[Dict[str, Any]]],
-                      limit: Optional[int] = None) -> Dict[str, Any]:
+                      limit: Optional[int] = None,
+                      event_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+                      ) -> Dict[str, Any]:
         """跨文献分析。
 
         输入画像来源优先级：
@@ -246,10 +371,16 @@ class ResearchAgent:
         result = self.analyzer.analyze(profiles)
         if result.get("_fallback"):
             print("[分析] 模型综合不可用，已生成本地结构化分析")
+            self._event(event_callback, "analysis_output", "跨文献分析输出", {
+                "analysis": result, "fallback": True,
+            })
             return result
         n_consensus = len(result.get("consensus", []))
         n_conflicts = len(result.get("conflicts", []))
         n_gaps = len(result.get("gaps", []))
         print(f"[分析] 完成：共识 {n_consensus} 条 | "
               f"分歧 {n_conflicts} 条 | 盲点 {n_gaps} 条")
+        self._event(event_callback, "analysis_output", "跨文献分析输出", {
+            "analysis": result, "fallback": False,
+        })
         return result
