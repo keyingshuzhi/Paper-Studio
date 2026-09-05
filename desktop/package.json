@@ -1,0 +1,52 @@
+{
+  "name": "paper-studio-desktop",
+  "version": "0.1.0",
+  "author": "Paper Studio Team",
+  "description": "Paper Studio — 本地优先的学术研究助理",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "backend": "node scripts/build-backend.js",
+    "prepack": "npm run backend",
+    "predist": "npm run backend",
+    "pack": "npm run backend && node scripts/package-current-platform.js --dir",
+    "dist": "node scripts/package-current-platform.js"
+  },
+  "devDependencies": {
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.paperstudio.app",
+    "productName": "Paper Studio",
+    "files": [
+      "main.js",
+      "preload.js"
+    ],
+    "extraResources": [
+      {
+        "from": "../build/backend-dist/paper-studio-backend",
+        "to": "backend"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "assets/icon.icns",
+      "target": ["dmg", "zip"],
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "identity": null
+    },
+    "win": {
+      "icon": "assets/icon.png",
+      "target": ["nsis", "zip"],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}
