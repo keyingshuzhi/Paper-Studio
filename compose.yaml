@@ -1,0 +1,39 @@
+services:
+  paper-studio:
+    image: ${PAPER_STUDIO_IMAGE:-ghcr.io/keyingshuzhi/paper-studio:v0.1.1}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: "0.1.1"
+    container_name: paper-studio
+    restart: unless-stopped
+    ports:
+      - "${PAPER_STUDIO_PORT:-8765}:8765"
+    environment:
+      PAPER_STUDIO_DATA_DIR: /data
+      PAPER_STUDIO_CONFIG_DIR: /config
+      TZ: ${TZ:-Asia/Shanghai}
+    # Lets a container use an Ollama instance running on the Docker host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Optional cloud-provider credentials can be placed in this ignored local
+    # file. The application also supports configuration through its UI.
+    env_file:
+      - path: ./docker-data/config/.env
+        required: false
+    volumes:
+      # All mutable research assets stay on the host, not in the image.
+      - ./docker-data/data:/data
+      # Stores model_config.json and an optional local .env, never committed.
+      - ./docker-data/config:/config
+    healthcheck:
+      test:
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/', timeout=3).close()"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

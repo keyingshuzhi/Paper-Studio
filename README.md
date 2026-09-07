@@ -99,6 +99,45 @@ npm run dist
 
 必须在对应的原生操作系统构建对应平台的安装包。更多桌面构建说明见 [desktop/README.md](desktop/README.md)。
 
+### Docker 部署
+
+v0.1.1 提供容器镜像与 Compose 部署方案。镜像发布地址为
+`ghcr.io/keyingshuzhi/paper-studio:v0.1.1`；GitHub Release 标签或手动运行
+「Publish Paper Studio container」工作流会构建 `linux/amd64` 与 `linux/arm64` 镜像。
+
+推荐使用 Compose，将所有可变数据持久化到项目当前目录下的 `docker-data/`：
+
+```bash
+mkdir -p docker-data/data docker-data/config
+docker compose up -d --build
+```
+
+浏览器访问 `http://127.0.0.1:8765`。后续使用已发布镜像时可跳过本地构建：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+`docker-data/data/` 保存报告、PDF、文献批次、知识记忆、任务和定时计划；
+`docker-data/config/` 保存 `model_config.json`，也可放置仅供本机使用的 `.env`。
+该目录已被 Git 忽略，不能提交 API Key 或研究数据。Linux 主机如遇目录权限问题，可执行：
+
+```bash
+sudo chown -R 10001:10001 docker-data
+```
+
+如使用宿主机的 Ollama，请在“设置 → 模型配置”中将 Ollama Base URL 设置为
+`http://host.docker.internal:11434`。Compose 已为 Linux、macOS 与 Windows 的 Docker
+环境提供该主机名映射。
+
+常用运维命令：
+
+```bash
+docker compose logs -f
+docker compose down
+```
+
 ## 数据与隐私
 
 - 研究报告、下载论文、阅读批注、知识记忆、任务队列和定时任务均保存在本机。
