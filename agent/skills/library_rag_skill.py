@@ -266,7 +266,7 @@ class LibraryRagSkill(BaseSkill):
         "基于已下载 PDF 文本的本地 RAG:支持 build_index/query/ask,"
         "回答带页码和原文引用片段。"
     )
-    version = "0.1.0"
+    version = "0.1.1"
     permissions = frozenset({
         SkillPermission.NETWORK,
         SkillPermission.FILESYSTEM_READ,

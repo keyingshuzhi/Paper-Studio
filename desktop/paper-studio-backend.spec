@@ -1,9 +1,23 @@
-"""Build the current platform's self-contained Paper Studio backend."""
+"""Build the current platform's complete self-contained Paper Studio backend.
+
+The Web/App process discovers skills, templates and MCP capabilities through
+registries.  Those imports are not always visible to PyInstaller's static
+analysis, so collect every application and MCP submodule explicitly.  This is
+intentional: a desktop release must include the same capability set as the Web
+source, rather than a partial subset that happens to be reachable at startup.
+"""
 
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules
+
 
 project_root = Path(SPECPATH).parent
+hiddenimports = sorted(set(
+    collect_submodules("agent")
+    + collect_submodules("mcp")
+    + ["agent.mcp_server"]
+))
 
 analysis = Analysis(
     [str(project_root / "desktop" / "backend_entry.py")],
@@ -13,7 +27,7 @@ analysis = Analysis(
         (str(project_root / "agent" / "static"), "agent/static"),
         (str(project_root / "agent" / "skills" / "SKILL.md"), "agent/skills"),
     ],
-    hiddenimports=["agent.mcp_server"],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

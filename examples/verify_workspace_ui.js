@@ -3,6 +3,7 @@
 // POST requests are intercepted: no real research, deletion or configuration writes.
 async (page) => {
   const checks = [], errors = [], writes = [];
+  const targetUrl = globalThis.process?.env?.PAPER_STUDIO_UI_URL || 'http://127.0.0.1:8765';
   const check = (name, ok, detail = '') => {
     checks.push({name, ok, detail});
     if (!ok) throw new Error(name + ': ' + JSON.stringify(detail));
@@ -11,7 +12,7 @@ async (page) => {
   const topics = ['长上下文模型与检索增强生成在学术研究中的证据追溯、可靠性评估与跨文献推理方法对比', 'Agent 可靠性'];
   const papers = Array.from({length:24}, (_, i) => ({index:i+1, title: i%3===0 ? 'Evidence-grounded Research Agents: A Comprehensive Study of Long-context Reasoning, Retrieval Augmentation and Reproducible Academic Workflows' : i%3===1 ? 'Retrieval-Augmented Generation for Research' : '多模型协作中的知识复用与研究质量评估', source:'arXiv', year:2026, status:i%4===3?'failed':'ok', pdf_exists:i%4!==3, text_exists:i%4!==3, pdf_path:'/ui-fixtures/paper-'+i+'.pdf', size_bytes:2050000, error:i%4===3?'下载暂时失败：上游服务返回 429，请稍候重试。':'', quality:{score:82-i, citation_count:42+i, explanation:['来源可核验','近两年文献','全文可用时纳入证据分析']}}));
   const library = {stats:{batches:1,items:24,downloaded:18,unavailable:0,failed:6},batches:[{run_id:'研究批次-20260905-8f3a',generated_at:'2026-09-05 10:00:00',stats:{total:24,downloaded:18,failed:6},items:papers}]};
-  const reports = Array.from({length:72},(_,i)=>({path:'/ui-fixtures/report-'+i+'.md',name:(i===0?topics[0]:i===1?'简短报告':'研究报告 '+String(i+1).padStart(2,'0'))+'.md',modified:'2026-09-05 10:'+String(59-i%60).padStart(2,'0')+':00',version_count:2}));
+  const reports = Array.from({length:72},(_,i)=>({path:'/ui-fixtures/report-'+i+'.md',name:(i===0?topics[0]:i===1?'简短报告':'研究报告 '+String(i+1).padStart(2,'0'))+'.md',modified:'2026-09-05 10:'+String(59-i%60).padStart(2,'0')+':00'}));
   const memoryItems = Array.from({length:40},(_,i)=>({query:topics[i%2]+(i>1?' · '+i:''),timestamp:'2026-09-05 09:00:00',updated_at:'2026-09-05 09:00:00',paper_count:12,pinned:i===0,reuse_count:i,matched_terms:['证据','可靠性']}));
   const content = '# '+topics[0]+'\n\n'+papers[0].title+'\n\n'+Array.from({length:40},(_,i)=>'## '+(i+1)+'. 研究发现与证据核验\n\n'+('研究结论应回到原始文献，比较实验方法、适用场景与局限，并记录可复现条件。'.repeat(8))+'\n\n- 证据来源与研究假设\n- 对比结果与待验证问题').join('\n\n');
   await page.unroute('**/api/**');
@@ -25,7 +26,6 @@ async (page) => {
     if (url.pathname==='/api/library') return send(library);
     if (url.pathname==='/api/reports') return send(reports);
     if (url.pathname==='/api/report') { const r=reports.find(item=>item.path===url.searchParams.get('path'))||reports[0]; return send({name:r.name,content}); }
-    if (url.pathname==='/api/report-versions') return send([{id:'v1',label:'初始版本',created_at:'2026-09-05 09:00:00',size:6000}]);
     if (url.pathname==='/api/memory') return send({entries:40,active_entries:38,archived_entries:2,total_papers:480,items:memoryItems});
     if (url.pathname==='/api/memory-entry') return send({query:url.searchParams.get('query'),pinned:url.searchParams.get('query')===topics[0],papers,analysis:{summary:'历史研究结论。'.repeat(150),gaps:[{gap:'需要更多可复现实验。'}]},summaries:papers.map(()=>({method:'对照实验',contribution:'可追溯的研究证据',limitation:'需要扩大验证范围'}))});
     if (url.pathname==='/api/memory-graph') return send({nodes:[{id:'a',type:'topic',label:'研究问题'},{id:'b',type:'paper',label:'代表文献'},{id:'c',type:'conclusion',label:'可追溯结论'}],edges:[{source:'a',target:'b'},{source:'b',target:'c'}]});
@@ -34,7 +34,7 @@ async (page) => {
   });
   await page.emulateMedia({reducedMotion:'reduce',colorScheme:'light'});
   await page.setViewportSize({width:1440,height:1000});
-  await page.goto('http://127.0.0.1:8765');
+  await page.goto(targetUrl);
   await page.waitForFunction(()=>document.body.classList.contains('ui-ready') && !document.body.classList.contains('booting') && document.querySelectorAll('.paper-row').length===24);
   check('启动动画结束后释放页面交互',await page.locator('body').getAttribute('aria-busy')==='false' && await page.locator('#appBoot').count()===0);
   await page.evaluate(()=>applyTheme('light'));
@@ -52,6 +52,31 @@ async (page) => {
   await page.waitForFunction(()=>document.querySelector('#p-jobs').classList.contains('on'));
   check('首页研究表单提交后进入任务中心并保留轮次',writes.some(item=>item.path==='/api/run'&&item.body.q==='验证研究提交交互'&&item.body.rounds===3));
   await nav('研究');
+  check('首页不再显示重复的技术对比模板',
+    await page.locator('#template option[value="research_template_compare"]').count()===0 &&
+    await page.getByRole('tab',{name:'对比研究',exact:true}).count()===1);
+  await page.locator('#template').selectOption('research_template_survey');
+  check('系统综述展示覆盖型优势与足够研究预算',
+    await page.locator('#templateProfile').isVisible() &&
+    (await page.locator('#templateProfileTitle').textContent()).includes('系统综述') &&
+    (await page.locator('#templateBenefits').textContent()).includes('多轮盲点追踪') &&
+    await page.locator('#rd').inputValue()==='3' && await page.locator('#mq').inputValue()==='6');
+  await page.locator('#template').selectOption('research_template_opening');
+  check('开题模式明确产出决策面板',
+    (await page.locator('#templateProfileOutput').textContent()).includes('开题决策面板') &&
+    (await page.locator('#templateBenefits').textContent()).includes('研究问题'));
+  await page.locator('#template').selectOption('research_template_daily');
+  check('每日追踪提供独立时间窗口',
+    await page.locator('#dailyWindowField').isVisible() &&
+    await page.locator('#templateDaysBack').inputValue()==='7' &&
+    (await page.locator('#templateProfileSummary').textContent()).includes('此前已经处理'));
+  await page.locator('#template').selectOption('research_template_competitor');
+  check('竞品模板支持证据补全与自定义对比维度',
+    (await page.locator('#q').getAttribute('placeholder')).includes('标题 | URL | 年份') &&
+    (await page.locator('#templateHint').textContent()).includes('补齐可用证据') &&
+    await page.locator('#competitorDimensionsField').isVisible() &&
+    (await page.locator('#competitorDimensions').inputValue()).includes('核心贡献'));
+  await page.locator('#template').selectOption('');
   await page.locator('#q').fill('');
   if(await page.locator('.agent-options').evaluate(el=>el.open)) await page.locator('.agent-options > summary').click();
   if(await page.evaluate(()=>document.body.classList.contains('nav-collapsed'))) await page.getByRole('button',{name:'收起或展开导航'}).click();
@@ -108,6 +133,7 @@ async (page) => {
   check('底部卡片操作区保持在文献滚动视口内',bottomActions.y>=libraryViewport.y && bottomActions.y+bottomActions.height<=libraryViewport.y+libraryViewport.height+1,{bottomActions,libraryViewport});
   check('缺失文件的操作保持位置并显示禁用',await page.locator('.paper-actions').last().locator('button:disabled').count()===3);
   await nav('研究报告');
+  check('报告页已取消无编辑入口支撑的版本功能',await page.locator('#snapshotReport,#reportVersions,.report-version-menu').count()===0);
   const reportSortLayout=await page.locator('#reportSort').evaluate(el=>{const style=getComputedStyle(el),rect=el.getBoundingClientRect();return{width:rect.width,paddingRight:style.paddingRight,backgroundPosition:style.backgroundPosition};});
   check('报告排序内容与下拉箭头保留充足空间',reportSortLayout.width>=112&&parseFloat(reportSortLayout.paddingRight)>=38&&reportSortLayout.backgroundPosition.includes('50%'),reportSortLayout);
   const searchDecoration=await page.locator('.report-toolbar').evaluate(el=>{

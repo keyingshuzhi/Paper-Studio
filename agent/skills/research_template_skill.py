@@ -1,13 +1,13 @@
-"""研究模板 Skills（v0.2.0）。
+"""研究模板 Skills（v0.3.0）。
 
 把过去只能通过「模式 = single / deep」+ 高级参数选择的研究能力，
 重新组织为 5 个面向业务的模板，让普通用户也能一眼选对入口：
 
 * ``research_template_survey`` — 综述（多轮深度闭环 + 大结果集 + 完整报告）
 * ``research_template_compare`` — 技术对比（多主题并行 + 横向综合）
-* ``research_template_opening`` — 开题调研（轻量级 + 不下载 + 简要报告）
-* ``research_template_competitor`` — 竞品论文分析（已知论文列表，跳过检索）
-* ``research_template_daily`` — 每日文献追踪（少量最新 + 摘要 + 简短日报）
+* ``research_template_opening`` — 开题调研（选题判断 + 问题转译 + 风险与路线）
+* ``research_template_competitor`` — 竞品论文分析（证据补齐 + 自定义维度矩阵）
+* ``research_template_daily`` — 每日文献追踪（时间窗口 + 历史去重 + 增量简报）
 
 每个模板是一个 ``BaseSkill``，遵循标准 Skill 契约：
 
@@ -90,7 +90,7 @@ class ResearchTemplateSurveySkill(BaseSkill):
     name = "research_template_survey"
     description = ("综述类研究:自动多轮检索、下载、批量摘要、跨文献分析,"
                    "产出完整深度报告;适合作为某一领域的入门到精通综述。")
-    version = "0.2.0"
+    version = "0.3.0"
     tags = ("template", "research", "survey", "deep", "long_form")
     examples = (
         {"query": "long-context LLM",
@@ -122,6 +122,13 @@ class ResearchTemplateSurveySkill(BaseSkill):
             "report": {"type": "boolean", "default": True},
             "research_direction": {"type": "string", "maxLength": 2000,
                                    "default": ""},
+            "rounds": {"type": "integer", "minimum": 2, "maximum": 5,
+                       "default": 3},
+            "branching": {"type": "integer", "minimum": 1, "maximum": 3,
+                          "default": 2},
+            "max_queries": {"type": "integer", "minimum": 2, "maximum": 20,
+                            "default": 6},
+            "analyze_citations": {"type": "boolean", "default": True},
         },
         "additionalProperties": True,
     }
@@ -147,21 +154,29 @@ class ResearchTemplateSurveySkill(BaseSkill):
                 download: bool = True,
                 report: bool = True,
                 research_direction: str = "",
+                rounds: int = 3, branching: int = 2,
+                max_queries: int = 6,
+                analyze_citations: bool = True,
                 **overrides: Any) -> Dict[str, Any]:
         if not (query or "").strip():
             raise SkillError("query 不能为空")
         self.report_progress(5, f"综述模板: {query}", stage="plan")
         agent = _build_agent()
-        result = agent.run(
+        from ..core.research_loop import ResearchLoop
+        loop = ResearchLoop(
+            agent=agent, reporter=agent.reporter,
+            max_rounds=max(2, int(rounds)),
+            branching=max(1, int(branching)),
+            max_queries=max(2, int(max_queries)),
+            analyze_citations=bool(analyze_citations))
+        result = loop.run(
             user_input=query,
-            summarize=True, analyze=True,
-            summarize_limit=max_results,
             max_results=max_results,
             max_downloads=max_downloads if download else 0,
             sources=list(sources) if sources else None,
             year_from=year_from,
             download=download,
-            report=report,
+            template=self.name,
             research_direction=research_direction,
             **overrides,
         )
@@ -169,11 +184,13 @@ class ResearchTemplateSurveySkill(BaseSkill):
         return {
             "template": "survey",
             "query": query,
-            "plan": _plan_dict(result.get("plan")),
+            "plan": {"mode": "deep", **dict(result.get("stats") or {})},
             "report_path": result.get("report_path"),
-            "paper_count": len(result.get("papers") or []),
-            "summary_count": len(result.get("summaries") or []),
-            "analysis": result.get("analysis"),
+            "paper_count": len(result.get("all_papers") or []),
+            "summary_count": sum(len(item.get("summaries") or [])
+                                 for item in result.get("rounds") or []),
+            "analysis": {"template_insights": (
+                result.get("stats") or {}).get("template_insights", {})},
         }
 
 
@@ -272,7 +289,7 @@ class ResearchTemplateOpeningSkill(BaseSkill):
     name = "research_template_opening"
     description = ("开题/选题阶段:快速检索近 3 年相关文献,生成简短摘要与"
                    "单轮报告,不下载原文;帮助判断选题价值与方向。")
-    version = "0.2.0"
+    version = "0.3.0"
     tags = ("template", "research", "opening", "lightweight")
     examples = (
         {"query": "graph neural network for drug discovery",
@@ -292,7 +309,7 @@ class ResearchTemplateOpeningSkill(BaseSkill):
             "query": {"type": "string", "minLength": 1},
             "max_results": {"type": "integer", "minimum": 1, "maximum": 50,
                             "default": 8},
-            "year_from": {"type": "integer", "default": 2022},
+            "year_from": {"type": ["integer", "null"]},
             "sources": {"type": ["array", "null"],
                         "items": {"type": "string"}},
             "report": {"type": "boolean", "default": True},
@@ -314,23 +331,27 @@ class ResearchTemplateOpeningSkill(BaseSkill):
     }
 
     def execute(self, query: str, *, max_results: int = 8,
-                year_from: int = 2022,
+                year_from: Optional[int] = None,
                 sources: Optional[Sequence[str]] = None,
                 report: bool = True,
                 **overrides: Any) -> Dict[str, Any]:
         if not (query or "").strip():
             raise SkillError("query 不能为空")
+        if year_from is None:
+            from datetime import datetime
+            year_from = datetime.now().year - 2
         self.report_progress(5, f"开题调研: {query}", stage="plan")
         agent = _build_agent()
         result = agent.run(
             user_input=query,
-            summarize=True, analyze=False,  # 开题阶段不跑跨文献分析
+            summarize=True, analyze=True,
             summarize_limit=max_results,
             max_results=max_results,
             sources=list(sources) if sources else None,
             year_from=year_from,
             download=False,  # 开题不下载
             report=report,
+            template=self.name,
             **overrides,
         )
         self.report_progress(95, "开题调研完成", stage="done")
@@ -341,6 +362,7 @@ class ResearchTemplateOpeningSkill(BaseSkill):
             "report_path": result.get("report_path"),
             "paper_count": len(result.get("papers") or []),
             "summary_count": len(result.get("summaries") or []),
+            "analysis": result.get("analysis"),
         }
 
 
@@ -348,12 +370,12 @@ class ResearchTemplateOpeningSkill(BaseSkill):
 
 
 class ResearchTemplateCompetitorSkill(BaseSkill):
-    """竞品论文分析:对一组已知论文做对比。"""
+    """竞品论文分析：补齐一组已知论文的公开证据后做维度化对比。"""
 
     name = "research_template_competitor"
-    description = ("竞品/竞品论文分析:对一组已知论文做摘要 + 横向对比,"
-                   "不重新检索;适合做工具/系统论文对比、产品级 benchmark。")
-    version = "0.2.0"
+    description = ("竞品/竞品论文分析:按标题补齐一组已知论文的公开元数据与"
+                   "摘要，再按自定义维度横向对比；适合工具/系统论文 benchmark。")
+    version = "0.3.0"
     tags = ("template", "research", "competitor", "comparison")
     examples = (
         {"papers": [{"title": "Toolformer", "url": "..."},
@@ -410,16 +432,20 @@ class ResearchTemplateCompetitorSkill(BaseSkill):
         self.report_progress(10, f"竞品分析: {len(papers)} 篇论文", stage="plan")
         normalized: List[Paper] = [_to_paper(p) for p in papers]
 
-        # 直接走 ResearchAgent 的 existing_papers 路径(已知论文,不重新检索)
+        # 走 existing_papers 闭集路径；仅按标题补齐缺失证据，不做主题扩展检索。
         agent = _build_agent()
         result = agent.run(
-            user_input="competitor_paper_analysis",
+            user_input="竞品论文分析：" + " vs ".join(
+                paper.title for paper in normalized),
             existing_papers=normalized,
             summarize=True,
             summarize_limit=len(normalized),
             analyze=True,
             download=False,
             report=report,
+            template=self.name,
+            compare_dimensions=list(compare_dimensions or []),
+            resolve_existing_papers=True,
             research_direction=research_direction,
             **overrides,
         )
@@ -444,7 +470,7 @@ class ResearchTemplateDailySkill(BaseSkill):
     name = "research_template_daily"
     description = ("每日文献追踪:限定最近 N 天的少量新文献,"
                    "生成结构化摘要 + 极简日报;适合在定时计划里每日执行。")
-    version = "0.2.0"
+    version = "0.3.0"
     tags = ("template", "research", "daily", "tracking", "lightweight")
     examples = (
         {"query": "Mamba", "days_back": 3, "max_results": 5},
@@ -509,6 +535,7 @@ class ResearchTemplateDailySkill(BaseSkill):
             download=False,  # 每日追踪不下载
             report=report,
             days_back=days_back,
+            template=self.name,
             **overrides,
         )
         self.report_progress(95, "每日追踪完成", stage="done")
@@ -521,4 +548,5 @@ class ResearchTemplateDailySkill(BaseSkill):
             "report_path": result.get("report_path"),
             "paper_count": len(result.get("papers") or []),
             "summary_count": len(result.get("summaries") or []),
+            "tracking": result.get("template_insights") or {},
         }

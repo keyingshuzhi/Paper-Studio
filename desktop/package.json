@@ -1,13 +1,13 @@
 {
   "name": "paper-studio-desktop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Paper Studio Team",
   "description": "Paper Studio — 本地优先的学术研究助理",
   "main": "main.js",
   "private": true,
   "scripts": {
     "start": "electron .",
-    "backend": "node scripts/build-backend.js",
+    "backend": "node scripts/build-backend.js && node scripts/verify-backend-bundle.js",
     "prepack": "npm run backend",
     "predist": "npm run backend",
     "pack": "npm run backend && node scripts/package-current-platform.js --dir",

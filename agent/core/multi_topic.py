@@ -67,6 +67,14 @@ class MultiTopicComparator:
         if len(topics) < 2:
             raise ValueError("有效主题不足 2 个")
 
+        # 对比驱动器统一负责最终报告，每个子主题只生成研究简报。
+        # 调用方（尤其是旧版模板任务）可能在 overrides 中留下 report、
+        # summarize 或 analyze；若原样透传，会和下面的固定参数重复，
+        # 触发 ``got multiple values for keyword argument``。
+        topic_overrides = dict(overrides)
+        for fixed_option in ("report", "summarize", "analyze"):
+            topic_overrides.pop(fixed_option, None)
+
         topic_digests: Dict[str, Dict[str, Any]] = {}
         for t in topics:
             print(f"\n[主题] 研究: {t!r}")
@@ -74,7 +82,7 @@ class MultiTopicComparator:
                 t, max_results=max_results,
                 summarize=True, analyze=True,
                 report=False,  # 统一由对比报告输出
-                **overrides)
+                **topic_overrides)
             topic_digests[t] = self._digest(t, result)
 
         # 横向综合（LLM）

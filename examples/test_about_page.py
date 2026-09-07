@@ -1,4 +1,4 @@
-"""设置 → 关于页面 v0.1.0 升级测试。
+"""设置 → 关于页面 v0.1.1 升级测试。
 
 覆盖:
   1) /api/about 返回完整结构(name, version, build_time, stats, capabilities, skill_categories)
@@ -42,7 +42,7 @@ def main() -> None:
         return
     expect("HTTP 200", status == 200)
     expect("name + version + build_time 字段", "name" in data and "version" in data and "build_time" in data, data)
-    expect("version 是 0.1.0", data.get("version") == "0.1.0", data.get("version"))
+    expect("version 是 0.1.1", data.get("version") == "0.1.1", data.get("version"))
     expect("stats.skills >= 25 (实际 30)", data.get("stats", {}).get("skills", 0) >= 25, data.get("stats"))
     expect("stats.agent_roles == 4", data.get("stats", {}).get("agent_roles") == 4, data.get("stats"))
     expect("stats.datasources == 4", data.get("stats", {}).get("datasources") == 4, data.get("stats"))
@@ -60,7 +60,7 @@ def main() -> None:
     expect("memory 类 >= 10 个 skill", len(sk.get("memory", [])) >= 10, sk.get("memory"))
 
     # ---- renderAbout 渲染完整 ----
-    print("\n== 用例 2:renderAbout 渲染 v0.1.0 全组件 ==")
+    print("\n== 用例 2:renderAbout 渲染 v0.1.1 全组件 ==")
     html_path = Path("agent/static/index.html")
     text = html_path.read_text(encoding="utf-8")
     ui_css = Path("agent/static/assets/ui-v2.css").read_text(encoding="utf-8")

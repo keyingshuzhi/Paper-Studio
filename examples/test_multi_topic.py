@@ -117,6 +117,15 @@ def main() -> None:
     expect("主题简报仍生成", len(result["topics"]) == 2)
     expect("报告仍生成", Path(result["report_path"]).exists())
 
+    print("== 用例 4：旧任务携带 report 参数仍可恢复 ==")
+    legacy_agent = FakeAgent()
+    comp = MultiTopicComparator(agent=legacy_agent, llm=NoKeyLLM())
+    result = comp.compare(["A", "B"], max_results=3, report=True)
+    expect("旧 report 参数不会与子任务固定参数冲突",
+           set(result["topics"]) == {"A", "B"})
+    expect("兼容任务仍生成统一对比报告",
+           Path(result["report_path"]).exists())
+
     print("\n全部用例通过 ✅")
 
 

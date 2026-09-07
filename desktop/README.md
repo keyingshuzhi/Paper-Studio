@@ -1,4 +1,4 @@
-# Paper Studio Desktop v0.1.0
+# Paper Studio Desktop v0.1.1
 
 Electron 桌面壳会在本机启动 Python Web 后端，并在窗口关闭时自动停止它。
 
@@ -33,13 +33,13 @@ npm run dist
 
 桌面进程强制使用 UTF-8，并通过流式解码器合并跨输出分片的中文字符。「任务」页会显示中文阶段、进度、耗时与可复制的完整日志。
 
-v0.1.0 使用全新的 Paper Studio 应用图标，并将模型凭据扩展为按服务商独立加密保存。设置页内置 Ollama、DeepSeek、OpenAI、OpenRouter、硅基流动、智谱、阿里百炼、火山方舟和 OneAPI，也允许添加任意 OpenAI 兼容服务商和模型；成本页面已从桌面界面移除。
+v0.1.1 使用统一的 Paper Studio 应用图标、模型服务商档案与加密多凭据。设置页内置 Ollama、DeepSeek、OpenAI、OpenRouter、硅基流动、智谱、阿里百炼、火山方舟和 OneAPI，也允许添加任意 OpenAI 兼容服务商和模型；成本页面已从桌面界面移除。构建时会收集全部 Agent、Skill、研究模板与 MCP 子模块，并在封装后验证知识记忆的归档、合并与长期整理能力。
 
 macOS 应用壳使用 `assets/icon.icns`，Windows 使用 `assets/icon.png`；Web 页面、品牌启动动画和应用内部图标仍使用共享前端资源，不受平台安装图标替换影响。启动动画支持浅色、暗色、随系统和“减少动态效果”偏好，并包含超时降级，不会阻塞主界面。
 
 当前发布文件命名：
 
-- macOS：`Paper Studio-0.1.0-arm64.dmg`、`Paper Studio-0.1.0-arm64.zip`
-- Windows：`Paper Studio-0.1.0-x64.exe`、`Paper Studio-0.1.0-x64.zip`
+- macOS：`Paper Studio-0.1.1-arm64.dmg`、`Paper Studio-0.1.1-arm64.zip`
+- Windows：`Paper Studio-0.1.1-x64.exe`、`Paper Studio-0.1.1-x64.zip`
 
 当前 macOS 构建未配置 Apple Developer ID 签名与公证，首次启动可能需要右键应用并选择“打开”。Windows 正式分发前同样建议配置代码签名证书。
