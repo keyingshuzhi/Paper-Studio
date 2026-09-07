@@ -35,7 +35,7 @@ npm run dist
 
 v0.1.1 使用统一的 Paper Studio 应用图标、模型服务商档案与加密多凭据。设置页内置 Ollama、DeepSeek、OpenAI、OpenRouter、硅基流动、智谱、阿里百炼、火山方舟和 OneAPI，也允许添加任意 OpenAI 兼容服务商和模型；成本页面已从桌面界面移除。构建时会收集全部 Agent、Skill、研究模板与 MCP 子模块，并在封装后验证知识记忆的归档、合并与长期整理能力。
 
-macOS 应用壳使用 `assets/icon.icns`，Windows 使用 `assets/icon.png`；Web 页面、品牌启动动画和应用内部图标仍使用共享前端资源，不受平台安装图标替换影响。启动动画支持浅色、暗色、随系统和“减少动态效果”偏好，并包含超时降级，不会阻塞主界面。
+macOS 应用壳使用 `assets/icon-mac.icns`，Windows 使用 `assets/icon-windows.ico`；Web 页面、品牌启动动画和应用内部图标仍使用共享前端资源，不受平台安装图标替换影响。启动动画支持浅色、暗色、随系统和“减少动态效果”偏好，并包含超时降级，不会阻塞主界面。
 
 当前发布文件命名：
 
