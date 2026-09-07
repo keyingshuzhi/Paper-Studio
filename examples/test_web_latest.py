@@ -1,4 +1,4 @@
-"""v0.1.0 Web、多服务商配置与核心能力接入回归测试。"""
+"""v0.1.1 Web、多服务商配置与核心能力接入回归测试。"""
 
 from __future__ import annotations
 
@@ -72,7 +72,26 @@ def main() -> None:
                all(marker in html for marker in (
                    'id="p-compare"', 'id="p-skills"', 'id="researchSource"',
                    'id="analyzeCitations"', 'id="newMemory"',
-                   'id="mcpServerStatus"')))
+                   'id="mcpServerStatus"', 'id="memoryActionDialog"',
+                   'function openMemoryAction')))
+        memory_handlers = "\n".join(
+            line for line in html.splitlines()
+            if '$("memoryMerge").onclick' in line
+            or '$("memoryCleanup").onclick' in line
+        )
+        expect("桌面版记忆管理使用应用内对话框，不依赖原生 prompt/confirm",
+               'openMemoryAction' in memory_handlers
+               and 'prompt(' not in memory_handlers
+               and 'confirm(' not in memory_handlers)
+        expect("首页取消重复的技术对比模板并保留独立页面",
+               '<option value="research_template_compare">' not in html and
+               'id="compareForm"' in html and '/api/compare' in html)
+        expect("四种模板展示各自优势与专属参数",
+               all(marker in html for marker in (
+                   'id="templateProfile"', 'id="templateBenefits"',
+                   'id="competitorDimensions"', 'id="templateDaysBack"',
+                   '系统综述证据地图', '开题决策面板',
+                   '竞品论文对照矩阵', '增量追踪简报')))
         expect("新版品牌与多服务商设置已进入 Web",
                all(marker in html for marker in (
                    '/assets/paper-studio-logo.png', 'id="providerGrid"',
@@ -89,6 +108,13 @@ def main() -> None:
         expect("成本页面及其前端调用已移除",
                'data-p="cost"' not in html and 'id="p-cost"' not in html and
                '/api/cost' not in html)
+        expect("报告版本保存与恢复入口已移除",
+               'id="snapshotReport"' not in html and
+               'id="reportVersions"' not in html and
+               '/api/report-version' not in html)
+        status, _removed_version_api = request(
+            base, "/api/report-versions?path=unused.md")
+        expect("报告版本 API 已下线", status == 404)
 
         with urlopen(base + "/assets/paper-studio-logo.png", timeout=5) as response:
             logo = response.read()
@@ -96,8 +122,8 @@ def main() -> None:
                response.status == 200 and logo[:8] == b"\x89PNG\r\n\x1a\n")
 
         status, about = request(base, "/api/about")
-        expect("Web 版本统一为 0.1.0",
-               status == 200 and about["version"] == APP_VERSION == "0.1.0")
+        expect("Web 版本统一为 0.1.1",
+               status == 200 and about["version"] == APP_VERSION == "0.1.1")
 
         status, settings = request(base, "/api/settings")
         builtins = {item["id"] for item in settings["provider_profiles"]}
@@ -268,10 +294,37 @@ def main() -> None:
                status == 200 and saved["query"] == "manual memory" and
                app.memory.has_query("manual memory"))
 
+        for query in ("desktop memory source", "desktop memory target"):
+            status, created = request(base, "/api/memory-write", {
+                "query": query, "papers": [], "summaries": [],
+                "analysis": {"summary": query, "gaps": []},
+                "confirmed": True,
+            })
+            expect(f"创建 {query} 用于合并验证",
+                   status == 200 and created["query"] == query)
+        status, merged_memory = request(base, "/api/memory-merge", {
+            "target_query": "desktop memory target",
+            "source_queries": ["desktop memory source"],
+            "confirmed": True,
+        })
+        expect("知识记忆合并 API 可用并返回来源记录",
+               status == 200 and "desktop memory source" in
+               (merged_memory.get("entry", {}).get("merged_from") or []))
+        status, source_memory = request(
+            base, "/api/memory-entry?query=desktop%20memory%20source")
+        expect("合并后来源主题会被归档",
+               status == 200 and source_memory.get("archived") is True)
+        status, cleanup = request(base, "/api/memory-cleanup", {
+            "max_age_days": 180, "confirmed": True,
+        })
+        expect("长期记忆整理 API 可用",
+               status == 200 and cleanup.get("action") == "archive"
+               and isinstance(cleanup.get("count"), int))
+
         status, server_info = request(base, "/api/mcp-server/info")
         expect("Web 显示 MCP Server 宿主配置和 18 项工具",
                status == 200 and server_info["tool_count"] == 18 and
-               server_info["app_version"] == "0.1.0" and
+               server_info["app_version"] == "0.1.1" and
                "mcpServers" in server_info["host_config"])
 
         # v0.2.0: 多 Agent 角色与研究模板 — 4 角色 + 5 模板应出现在 Web 清单
@@ -323,10 +376,7 @@ def main() -> None:
                advanced["analyze_citations"] is False and
                advanced["provider"] == "institution")
 
-        # v0.2.0: 模板任务 — /api/run 携带 template 时应走研究模板 Skill 路径
-        # 这里 submit_template 内部会做 preview invoke,会真实尝试 LLM/网络,
-        # 所以用一个不在 settings 里的 profile + 故意无 LLM 的环境会被拒;
-        # 只验证参数校验/调度入口(用不存在的 template 时,返回 400)。
+        # 模板入口只做 Schema 预检，不应在 HTTP 提交阶段执行模型请求。
         status, bad = request(base, "/api/run", {
             "q": "test template", "mode": "single",
             "template": "not-a-real-template",
@@ -334,6 +384,64 @@ def main() -> None:
         expect("未注册的 template 应被拒",
                status == 400 and ("模板" in bad.get("error", "")
                                   or "template" in bad.get("error", "").lower()))
+        template_cases = [
+            ("research_template_survey", "agent reliability", "deep"),
+            ("research_template_opening", "AI for science", "single"),
+            ("research_template_competitor",
+             "Toolformer | https://example.test/toolformer | 2023\n"
+             "ReAct | https://example.test/react | 2022", "single"),
+            ("research_template_daily", "research agents", "single"),
+        ]
+        calls_before_templates = len(calls)
+        for offset, (template_id, template_query, expected_mode) in enumerate(
+                template_cases, start=1):
+            started = time.monotonic()
+            status, submitted = request(base, "/api/run", {
+                "q": template_query, "mode": "deep", "template": template_id,
+                "max_results": 6, "rounds": 3, "branching": 1,
+                "max_queries": 4, "download": False, "days_back": 14,
+                "compare_dimensions": ["方法路线", "已知局限"],
+            })
+            expect(f"{template_id} 可立即提交到队列",
+                   status == 200 and bool(submitted.get("job_id"))
+                   and time.monotonic() - started < 2)
+            wait_calls(calls, calls_before_templates + offset)
+            invoked = calls[calls_before_templates + offset - 1]
+            expect(f"{template_id} 使用统一可恢复执行器",
+                   invoked.get("template") == template_id
+                   and invoked.get("mode") == expected_mode)
+        expect("竞品模板传入两篇已知论文",
+               len(calls[calls_before_templates + 2].get(
+                   "existing_papers") or []) == 2)
+        expect("综述模板保证足够的覆盖预算",
+               calls[calls_before_templates].get("rounds") >= 3 and
+               calls[calls_before_templates].get("branching") >= 2 and
+               calls[calls_before_templates].get("max_queries") >= 6)
+        expect("开题执行跨文献决策分析，每日追踪保持低成本",
+               calls[calls_before_templates + 1].get("analysis_enabled") is True
+               and calls[calls_before_templates + 3].get(
+                   "analysis_enabled") is False)
+        expect("竞品启用证据补全和自定义维度",
+               calls[calls_before_templates + 2].get(
+                   "resolve_existing_papers") is True and
+               calls[calls_before_templates + 2].get(
+                   "compare_dimensions") == ["方法路线", "已知局限"])
+        expected_daily_year = time.localtime(
+            time.time() - 14 * 24 * 60 * 60).tm_year
+        expect("每日追踪透传时间窗口并自动收紧检索年份",
+               calls[calls_before_templates + 3].get("days_back") == 14
+               and calls[calls_before_templates + 3].get(
+                   "year_from") == expected_daily_year)
+        time.sleep(.1)
+        expect("首页四种模板都只执行一次",
+               len(calls) == calls_before_templates + len(template_cases))
+        for template_id, template_query in (
+                ("research_template_competitor", "only one paper"),):
+            status, invalid = request(base, "/api/run", {
+                "q": template_query, "mode": "deep", "template": template_id,
+            })
+            expect(f"{template_id} 缺少对比项时给出明确提示",
+                   status == 400 and "2" in invalid.get("error", ""))
         status, schedule = request(base, "/api/schedules", {
             "query": "scheduled research", "mode": "deep",
             "interval_minutes": 60, "max_results": 5,
@@ -345,12 +453,13 @@ def main() -> None:
         expect("定时计划保留完整研究参数",
                status == 200 and schedule["sources"] == ["scholar_search"] and
                schedule["year_from"] == 2022 and schedule["download"] is True)
+        scheduled_index = len(calls)
         status, _scheduled = request(base, "/api/schedule-run", {
             "id": schedule["id"],
         })
         expect("定时计划可立即进入队列", status == 200)
-        wait_calls(calls, 2)
-        scheduled = calls[1]
+        wait_calls(calls, scheduled_index + 1)
+        scheduled = calls[scheduled_index]
         expect("定时任务将新参数传入执行器",
                scheduled["sources"] == ["scholar_search"] and
                scheduled["year_from"] == 2022 and
@@ -359,14 +468,15 @@ def main() -> None:
                scheduled["download"] is True and
                scheduled["max_downloads"] == 7)
 
+        comparison_index = len(calls)
         status, _compare = request(base, "/api/compare", {
             "topics": ["Transformer", "Mamba"], "max_results": 6,
             "provider": "ollama", "sources": ["scholar_search"],
             "year_from": 2023, "summarize_limit": 3,
         })
         expect("多主题对比任务提交成功", status == 200)
-        wait_calls(calls, 3)
-        comparison = calls[2]
+        wait_calls(calls, comparison_index + 1)
+        comparison = calls[comparison_index]
         expect("多主题对比进入统一执行器和任务控制",
                comparison["mode"] == "compare" and
                comparison["topics"] == ["Transformer", "Mamba"] and

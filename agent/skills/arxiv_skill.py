@@ -134,6 +134,7 @@ class ArxivSkill(BaseSkill):
             title = _first_text(entry, "a:title") or ""
             summary = _clean_abstract(_first_text(entry, "a:summary") or "")
             published = _first_text(entry, "a:published") or ""
+            updated = _first_text(entry, "a:updated") or ""
             year = int(published[:4]) if len(published) >= 4 else None
 
             authors = [a.text for a in entry.findall("a:author/a:name", _ATOM_NS)
@@ -161,5 +162,7 @@ class ArxivSkill(BaseSkill):
                 doi=doi,
                 pdf_url=pdf_url,
                 venue="arXiv",
+                extra={"published_date": published[:10],
+                       "updated": updated[:10]},
             ))
         return papers

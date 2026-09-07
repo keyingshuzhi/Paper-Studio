@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -103,6 +104,13 @@ class ResearchAgent:
                     continue
         if raw_existing is not None and not existing_papers:
             raise ValueError("未找到可用于继续研究的本地文献")
+        if existing_papers and overrides.get("resolve_existing_papers"):
+            existing_papers = self._resolve_existing_papers(
+                existing_papers,
+                sources=overrides.get("sources"),
+                checkpoint=checkpoint,
+                event_callback=event_callback,
+            )
 
         plan: ResearchPlan = self.planner.make_plan(effective_input, **overrides)
         if existing_papers:
@@ -134,15 +142,45 @@ class ResearchAgent:
                 "papers": [paper.to_dict() for paper in papers],
             })
         else:
+            search_options: Dict[str, Any] = {}
+            if plan.year_from is not None:
+                search_options["year_from"] = plan.year_from
+            search_limit = plan.max_results
+            if overrides.get("days_back") is not None:
+                # 每日追踪优先请求按提交日期排序；不支持该字段的来源会安全忽略。
+                search_options["sort_by"] = "submittedDate"
+                # 先取更宽的候选池再按精确日期筛选，避免相关性排序前几项都
+                # 在时间窗口外，导致明明有新论文却生成空日报。
+                search_limit = min(50, max(plan.max_results,
+                                           plan.max_results * 3))
             papers = self.search_plugin.run(
                 query=plan.query,
-                max_results=plan.max_results,
+                max_results=search_limit,
                 sources=plan.sources,
+                **search_options,
             )
 
         # 年份过滤（LLM 解析出的 year_from）
         if plan.year_from:
             papers = [p for p in papers if (p.year or 0) >= plan.year_from]
+        daily_stats: Dict[str, Any] = {}
+        if overrides.get("days_back") is not None and not existing_papers:
+            from .template_insights import filter_daily_papers
+            papers, daily_stats = filter_daily_papers(
+                papers, int(overrides.get("days_back") or 7),
+                overrides.get("seen_paper_keys") or [])
+            matched_count = len(papers)
+            papers = papers[:plan.max_results]
+            daily_stats["matched_count"] = matched_count
+            daily_stats["new_count"] = len(papers)
+            daily_stats["deferred_count"] = max(0, matched_count - len(papers))
+            daily_stats["candidate_limit_per_source"] = search_limit
+            print("[追踪] 时间窗口 "
+                  f"{daily_stats.get('days_back')} 天 | "
+                  f"匹配 {matched_count} | 本期处理 {len(papers)} | "
+                  f"历史去重 {daily_stats.get('already_seen_count')} | "
+                  f"窗口外 {daily_stats.get('outside_window_count')}")
+            self._event(event_callback, "daily_filter", "增量文献筛选", daily_stats)
         excluded = {
             self._title_key(title) for title in overrides.get("exclude_titles", [])
             if self._title_key(title)
@@ -203,6 +241,21 @@ class ResearchAgent:
             analysis = dict(analysis or {})
             analysis["historical_reuse"] = historical_reuse
 
+        template_insights: Dict[str, Any] = {}
+        template = str(overrides.get("template") or "")
+        if template:
+            from .template_insights import build_single_template_insights
+            template_insights = build_single_template_insights(
+                template, user_input, papers, summaries, analysis,
+                compare_dimensions=overrides.get("compare_dimensions"),
+                daily_stats=daily_stats)
+            if template_insights:
+                analysis = dict(analysis or {})
+                analysis["template_insights"] = template_insights
+                self._event(event_callback, "template_insights",
+                            str(template_insights.get("title") or "模板分析"),
+                            template_insights)
+
         # 5) 报告生成（MCP 输出）
         report_path = None
         if plan.report:
@@ -220,6 +273,8 @@ class ResearchAgent:
             "acquisition": acquisition,
             "summaries": summaries,
             "analysis": analysis,
+            "template_insights": template_insights,
+            "daily_stats": daily_stats,
             "report_path": str(report_path) if report_path else None,
             "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -233,6 +288,57 @@ class ResearchAgent:
     @staticmethod
     def _title_key(title: Any) -> str:
         return " ".join(str(title or "").casefold().split())
+
+    def _resolve_existing_papers(
+            self, papers: List[Paper], *, sources: Optional[List[str]],
+            checkpoint: Optional[Callable[[], None]],
+            event_callback: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> List[Paper]:
+        """按标题补齐竞品论文元数据，避免只有标题时生成空洞对比。"""
+        resolved: List[Paper] = []
+        matched = 0
+        for index, paper in enumerate(papers, 1):
+            self._checkpoint(checkpoint)
+            if paper.abstract:
+                resolved.append(paper)
+                matched += 1
+                continue
+            try:
+                candidates = self.search_plugin.run(
+                    query=f'"{paper.title}"', max_results=3,
+                    sources=sources)
+            except Exception as err:  # 单篇补全失败不能中断整个竞品任务
+                print(f"[竞品] 元数据补全失败 {paper.title!r}: {err}")
+                resolved.append(paper)
+                continue
+            target = self._title_key(paper.title)
+            scored = [
+                (SequenceMatcher(None, target, self._title_key(item.title)).ratio(), item)
+                for item in candidates if self._title_key(item.title)
+            ]
+            score, best = max(scored, default=(0.0, paper), key=lambda item: item[0])
+            if score < 0.58:
+                resolved.append(paper)
+                continue
+            matched += 1
+            resolved.append(Paper(
+                title=paper.title or best.title,
+                url=(paper.url if paper.url and paper.url != "..." else best.url),
+                source=(best.source or paper.source),
+                authors=paper.authors or best.authors,
+                year=paper.year or best.year,
+                abstract=paper.abstract or best.abstract,
+                doi=paper.doi or best.doi,
+                pdf_url=paper.pdf_url or best.pdf_url,
+                venue=paper.venue or best.venue,
+                extra={**dict(best.extra or {}), **dict(paper.extra or {}),
+                       "title_match": round(score, 3)},
+            ))
+            self._event(event_callback, "competitor_resolve", "补全竞品论文",
+                        {"index": index, "title": paper.title,
+                         "matched_title": best.title, "score": round(score, 3)})
+        print(f"[竞品] 已补全 {matched}/{len(papers)} 篇论文的可用证据")
+        return resolved
 
     @staticmethod
     def _event(callback: Optional[Callable[[Dict[str, Any]], None]],

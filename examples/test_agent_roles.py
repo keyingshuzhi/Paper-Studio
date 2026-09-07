@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict
 
@@ -172,56 +171,50 @@ def test_templates_input_validation() -> None:
 
 
 def test_templates_dry_run() -> None:
-    """模拟模板入口:用 monkey-patch 替换 ResearchAgent,验证调用链。"""
-    print("== 用例 9：模板 dry-run(用 stub agent) ==")
+    """模拟系统综述入口，验证它确实走多轮闭环。"""
+    print("== 用例 9：系统综述 dry-run(用 stub loop) ==")
     from agent.skills import research_template_skill as rt_module
+    from agent.core import research_loop as loop_module
 
     captured: Dict[str, Any] = {}
 
-    @dataclass
-    class StubPlan:
-        query: str = ""
-        original_query: str = ""
-        max_results: int = 5
-        sources: Any = None
-        download: bool = False
-        max_downloads: Any = None
-        report: bool = True
-        year_from: Any = None
-        extra: Dict[str, Any] = field(default_factory=dict)
-
     class StubAgent:
+        reporter = object()
+
+        def run(self, user_input, **kwargs):
+            captured["user_input"] = user_input
+            captured.update(kwargs)
+
+    class StubLoop:
+        def __init__(self, **kwargs):
+            captured["loop"] = kwargs
+
         def run(self, user_input, **kwargs):
             captured["user_input"] = user_input
             captured.update(kwargs)
             return {
-                "plan": StubPlan(
-                    query=user_input, original_query=user_input,
-                    max_results=kwargs.get("max_results", 5),
-                    sources=kwargs.get("sources"),
-                    download=kwargs.get("download", False),
-                    max_downloads=kwargs.get("max_downloads"),
-                    report=kwargs.get("report", True),
-                    year_from=kwargs.get("year_from"),
-                ),
-                "papers": [],
-                "acquisition": None,
-                "summaries": [],
-                "analysis": None,
+                "stats": {"template_insights": {"kind": "survey"}},
+                "rounds": [{"summaries": []}],
+                "all_papers": [],
                 "report_path": "/tmp/stub-report.md",
             }
 
     rt_module._build_agent = lambda: StubAgent()  # type: ignore
+    loop_module.ResearchLoop = StubLoop  # type: ignore
 
     s = ResearchTemplateSurveySkill()
     result = s.execute(query="long-context LLM", max_results=8, year_from=2024)
     expect("survey 模板走 stub agent", captured.get("user_input") == "long-context LLM")
     expect("survey 模板透传 max_results",
            captured.get("max_results") == 8, captured.get("max_results"))
-    expect("survey 模板默认 summarize=True",
-           captured.get("summarize") is True, captured.get("summarize"))
-    expect("survey 模板默认 analyze=True",
-           captured.get("analyze") is True, captured.get("analyze"))
+    expect("survey 模板走 3 轮、2 分支、6 查询的深度闭环",
+           captured.get("loop", {}).get("max_rounds") == 3
+           and captured.get("loop", {}).get("branching") == 2
+           and captured.get("loop", {}).get("max_queries") == 6,
+           captured.get("loop"))
+    expect("survey 模板传入专属产物标识",
+           captured.get("template") == "research_template_survey",
+           captured.get("template"))
     expect("survey 模板返回 template=survey",
            result.get("template") == "survey", result)
     expect("survey 模板返回 report_path",

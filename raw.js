@@ -143,7 +143,7 @@ async function callExternalMcpTool(serverId,encodedName){const name=decodeURICom
 let providerProfiles=[],editingProviderId="",providerSecrets={},latestModelConfig=null;
 function toast(message,kind="good"){const item=document.createElement("div");item.className="toast "+kind;item.textContent=message;$("toastStack").appendChild(item);setTimeout(()=>{item.style.opacity="0";item.style.transform="translateY(8px)";setTimeout(()=>item.remove(),250)},2800)}
 function renderAbout(info={}){
-  const version=info.version||"0.1.0",
+  const version=info.version||"0.1.1",
         buildTime=info.build_time||"2026-09-05",
         stats=info.stats||{skills:30,agent_roles:4,datasources:4,mcp_tools:18},
         caps=info.capabilities||[];
@@ -221,7 +221,7 @@ async function loadAbout(){
     renderAbout(info);
     target.dataset.loaded="1";
   }catch(error){
-    renderAbout({version:"0.1.0",build_time:"-",stats:{skills:0,agent_roles:0,datasources:0,mcp_tools:0},capabilities:[]});
+    renderAbout({version:"0.1.1",build_time:"-",stats:{skills:0,agent_roles:0,datasources:0,mcp_tools:0},capabilities:[]});
     target.dataset.loaded="err";
     toast("关于信息读取失败: "+(error.message||"未知错误"),"bad");
   }finally{

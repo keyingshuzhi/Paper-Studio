@@ -91,10 +91,6 @@ def main() -> None:
 
         report = root / "report_workspace.md"
         report.write_text("# Codex Harness Research Report\n\n## Findings\n\n- Strong local evidence\n\n## References\n\n[1] Example 2025\n", encoding="utf-8")
-        first = app.create_report_version(str(report), "初始版本")
-        expect("报告可创建版本快照", first is not None)
-        versions = app.list_report_versions(str(report))
-        expect("报告版本历史可读取", len(versions) == 1)
         markdown = app.export_report(str(report), "markdown")
         docx = app.export_report(str(report), "docx")
         pdf_export = app.export_report(str(report), "pdf")

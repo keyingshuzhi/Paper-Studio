@@ -42,6 +42,10 @@ function main() {
     cwd: desktopDir,
     env: {
       ...process.env,
+      // Keep uv's downloaded wheels/cache inside the build workspace when a
+      // caller has not chosen a cache directory.  The desktop build remains
+      // self-contained and never depends on an accidental developer venv.
+      UV_CACHE_DIR: process.env.UV_CACHE_DIR || path.join(projectRoot, "build", "uv-cache"),
       PYINSTALLER_CONFIG_DIR: path.join(projectRoot, "build", "pyinstaller-cache"),
     },
     stdio: "inherit",

@@ -1,4 +1,4 @@
-"""Paper Studio v0.1.0 Web interface and Electron shared backend.
+"""Paper Studio v0.1.1 Web interface and Electron shared backend.
 
 功能：
 - 多服务商 LLM：内置常用预设，并支持任意 OpenAI 兼容服务商与模型
@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta
 import hashlib
 import json
 import os
@@ -42,7 +43,7 @@ from .read_service import resolve_data_dir
 from .report_export import export_docx, export_name, export_pdf
 
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 _RESEARCH_SOURCES = frozenset({"arxiv_search", "scholar_search"})
 _SKILL_CONFIRM_PERMISSIONS = frozenset({
     "network", "filesystem.write", "paid_api", "external.write", "destructive",
@@ -601,6 +602,7 @@ class ResearchWebApp:
                  jobs_path: Optional[str] = None) -> None:
         self.data_dir = resolve_data_dir()
         self.annotations_path = self.data_dir / "library_annotations.json"
+        self.daily_tracking_path = self.data_dir / "daily_tracking.json"
         self.report_versions_path = self.data_dir / "report_versions.json"
         self.report_versions_dir = self.data_dir / "report_versions"
         self.exports_dir = self.data_dir / "exports"
@@ -705,7 +707,9 @@ class ResearchWebApp:
             "mode", "max_results", "rounds", "branching", "max_queries",
             "provider", "model", "download", "max_downloads", "sources",
             "year_from", "summarize_limit", "analyze_citations", "topics",
-            "download_interval", "library_selection",
+            "download_interval", "library_selection", "template",
+            "analysis_enabled", "days_back", "existing_papers",
+            "compare_dimensions", "resolve_existing_papers",
         }
         return {key: ResearchWebApp._safe_trace_value(value)
                 for key, value in options.items() if key in allowed}
@@ -882,15 +886,29 @@ class ResearchWebApp:
                summarize_limit: Optional[int] = None,
                analyze_citations: bool = True,
                topics: Optional[List[str]] = None,
-               library_selection: Optional[List[Dict[str, Any]]] = None) -> str:
+               library_selection: Optional[List[Dict[str, Any]]] = None,
+               template: Optional[str] = None,
+               analysis_enabled: bool = True,
+               days_back: Optional[int] = None,
+               existing_papers: Optional[List[Dict[str, Any]]] = None,
+               compare_dimensions: Optional[List[str]] = None,
+               resolve_existing_papers: bool = False) -> str:
         """提交任务，返回 job_id。"""
         with self.lock:
             job_id = self._new_job_id()
             while job_id in self.jobs:  # 极低概率碰撞保护
                 job_id = self._new_job_id()
-            mode_label = ({"deep": "深度闭环", "single": "单轮",
-                           "compare": "多主题对比",
-                           "library": "已有文献续研"}.get(mode, mode))
+            template_labels = {
+                "research_template_survey": "综述研究",
+                "research_template_compare": "技术对比",
+                "research_template_opening": "开题调研",
+                "research_template_competitor": "竞品论文分析",
+                "research_template_daily": "每日文献追踪",
+            }
+            mode_label = template_labels.get(str(template or "")) or ({
+                "deep": "深度闭环", "single": "单轮",
+                "compare": "多主题对比", "library": "已有文献续研",
+            }.get(mode, mode))
             opts = {"mode": mode, "max_results": max_results,
                     "rounds": rounds, "branching": branching,
                     "max_queries": max_queries,
@@ -905,6 +923,13 @@ class ResearchWebApp:
                     "topics": list(topics or []),
                     "library_selection": self._safe_trace_value(
                         list(library_selection or [])),
+                    "template": str(template or ""),
+                    "analysis_enabled": bool(analysis_enabled),
+                    "days_back": days_back,
+                    "existing_papers": self._safe_trace_value(
+                        list(existing_papers or [])),
+                    "compare_dimensions": list(compare_dimensions or []),
+                    "resolve_existing_papers": bool(resolve_existing_papers),
                     "download_interval": float(
                         self.settings.get("download_interval", 2.0))}
             self.jobs[job_id] = {
@@ -951,126 +976,88 @@ class ResearchWebApp:
         """通过研究模板 Skill 提交任务。
 
         把表单字段映射到模板的 input_schema(综述/对比/开题/竞品/每日追踪),
-        复用既有 job 调度循环。模板不可用时退回通用模式并记录在 description。
+        只做 Schema 预检，再转换为统一的可恢复任务。这样所有
+        模板都使用 Web 中已选的模型服务，也不会在 HTTP 提交阶段
+        误执行一次完整研究。
         """
-        from .skills import BaseSkill, SkillPermission
+        from .skills import BaseSkill, SkillContractError, validate_json_schema
         if not BaseSkill.has(template_id):
             raise ValueError(f"未注册的研究模板: {template_id}")
-        from .skills.research_template_skill import (
-            ResearchTemplateCompareSkill, ResearchTemplateCompetitorSkill,
-            ResearchTemplateDailySkill, ResearchTemplateOpeningSkill,
-            ResearchTemplateSurveySkill,
-        )
-        allowed = {SkillPermission.FILESYSTEM_READ,
-                   SkillPermission.FILESYSTEM_WRITE,
-                   SkillPermission.NETWORK,
-                   SkillPermission.PAID_API}
         builder_args = self._build_template_args(
             template_id, query, payload)
-        # 描述写到任务卡片,便于用户在任务中心识别模板
-        desc_prefix = f"模板[{template_id.split('_')[-1]}]"
-        if template_id == "research_template_compare":
-            skill = ResearchTemplateCompareSkill()
-        elif template_id == "research_template_competitor":
-            skill = ResearchTemplateCompetitorSkill()
-        elif template_id == "research_template_daily":
-            skill = ResearchTemplateDailySkill()
-        elif template_id == "research_template_opening":
-            skill = ResearchTemplateOpeningSkill()
-        else:
-            skill = ResearchTemplateSurveySkill()
-        # 通过 invoke 校验参数,真正执行时仍走 ResearchAgent
-        preview = skill.invoke(allowed_permissions=allowed,
-                               progress_callback=lambda e: None, **builder_args)
-        if not preview.ok:
-            raise ValueError(preview.error.message
-                             if preview.error else "模板参数无效")
-        # 创建一个轻量 job,执行时调模板 Skill
-        job_id = self._new_job_id()
-        with self.lock:
-            self.jobs[job_id] = {
-                "id": job_id,
-                "query": query,
-                "desc": f"{desc_prefix} {query[:60]}",
-                "mode": "deep", "phase": "queued",
-                "status": "queued",
-                "events": [],
-                "logs": [],
-                "report_path": None,
-                "template": template_id,
-                "template_args": builder_args,
-            }
-            self._save_jobs_locked()
-        self._start_template_job(job_id, template_id, builder_args)
-        return job_id
+        skill = BaseSkill.get(template_id)
+        try:
+            validate_json_schema(builder_args, skill.input_schema)
+        except SkillContractError as err:
+            raise ValueError(f"研究模板参数无效: {err}") from err
 
-    def _start_template_job(self, job_id: str, template_id: str,
-                            builder_args: Dict[str, Any]) -> None:
-        """异步执行模板 Skill,产出报告并写回 job。"""
-        from .skills import BaseSkill, SkillPermission
-        from .skills.research_template_skill import (
-            ResearchTemplateCompareSkill, ResearchTemplateCompetitorSkill,
-            ResearchTemplateDailySkill, ResearchTemplateOpeningSkill,
-            ResearchTemplateSurveySkill,
-        )
-        skill_cls_map = {
-            "research_template_survey": ResearchTemplateSurveySkill,
-            "research_template_compare": ResearchTemplateCompareSkill,
-            "research_template_competitor": ResearchTemplateCompetitorSkill,
-            "research_template_daily": ResearchTemplateDailySkill,
-            "research_template_opening": ResearchTemplateOpeningSkill,
+        common = {
+            "rounds": int(payload.get("rounds") or 2),
+            "branching": int(payload.get("branching") or 1),
+            "max_queries": int(payload.get("max_queries") or 3),
+            "provider": str(payload.get("provider") or "auto"),
+            "model": payload.get("model"),
+            "budget_cny": payload.get("budget_cny"),
+            "sources": payload.get("sources") or None,
+            "year_from": builder_args.get(
+                "year_from", payload.get("year_from")),
+            "analyze_citations": bool(payload.get("analyze_citations", True)),
+            "template": template_id,
         }
-        skill_cls = skill_cls_map.get(template_id, ResearchTemplateSurveySkill)
-        skill = skill_cls()
-        allowed = {SkillPermission.FILESYSTEM_READ,
-                   SkillPermission.FILESYSTEM_WRITE,
-                   SkillPermission.NETWORK,
-                   SkillPermission.PAID_API}
-        def _run():
-            from .skills import SkillResult
-            job = self.jobs.get(job_id, {})
-            job["status"] = "running"
-            self._save_jobs_locked()
-            job.setdefault("events", []).append({
-                "kind": "template_start",
-                "title": f"启动模板: {template_id}",
-                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "data": {"template": template_id},
-            })
-            result = skill.invoke(allowed_permissions=allowed,
-                                  progress_callback=lambda e: None, **builder_args)
-            if not result.ok:
-                self.jobs[job_id]["status"] = "error"
-                self.jobs[job_id]["error"] = (
-                    result.error.to_dict() if result.error
-                    else {"code": "unknown"})
-                job.setdefault("events", []).append({
-                    "kind": "template_error",
-                    "title": "模板执行失败",
-                    "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "data": self.jobs[job_id]["error"],
-                })
-                self._save_jobs_locked()
-                return
-            data = result.data or {}
-            report_path = data.get("report_path")
-            if report_path:
-                self.jobs[job_id]["report_path"] = report_path
-            self.jobs[job_id]["template_data"] = {
-                "template": data.get("template"),
-                "paper_count": data.get("paper_count"),
-                "summary_count": data.get("summary_count"),
-                "report_path": report_path,
-            }
-            self.jobs[job_id]["status"] = "done"
-            job.setdefault("events", []).append({
-                "kind": "template_done",
-                "title": "模板研究完成",
-                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "data": self.jobs[job_id]["template_data"],
-            })
-            self._save_jobs_locked()
-        threading.Thread(target=_run, daemon=True).start()
+        if template_id == "research_template_survey":
+            survey_common = dict(common)
+            survey_common["rounds"] = max(3, int(common["rounds"]))
+            survey_common["branching"] = max(2, int(common["branching"]))
+            survey_common["max_queries"] = max(6, int(common["max_queries"]))
+            return self.submit(
+                query, mode="deep",
+                max_results=builder_args["max_results"],
+                max_downloads=builder_args["max_downloads"],
+                download=builder_args["download"],
+                summarize_limit=(payload.get("summarize_limit") or
+                                 builder_args["max_results"]),
+                **survey_common)
+        if template_id == "research_template_compare":
+            topics = list(builder_args["topics"])
+            return self.submit(
+                " ↔ ".join(topics), mode="compare", topics=topics,
+                max_results=builder_args["max_results"],
+                download=bool(payload.get("download")),
+                max_downloads=payload.get("max_downloads"),
+                summarize_limit=(payload.get("summarize_limit") or
+                                 builder_args["max_results"]),
+                **common)
+        if template_id == "research_template_opening":
+            return self.submit(
+                query, mode="single",
+                max_results=builder_args["max_results"],
+                download=False, max_downloads=None,
+                summarize_limit=builder_args["max_results"],
+                analysis_enabled=True, analyze_citations=False,
+                **{key: value for key, value in common.items()
+                   if key != "analyze_citations"})
+        if template_id == "research_template_competitor":
+            papers = list(builder_args["papers"])
+            titles = [str(item.get("title") or "") for item in papers]
+            return self.submit(
+                "竞品论文分析：" + " ↔ ".join(titles),
+                mode="single", max_results=len(papers),
+                download=False, max_downloads=None,
+                summarize_limit=len(papers), existing_papers=papers,
+                compare_dimensions=builder_args["compare_dimensions"],
+                resolve_existing_papers=True,
+                **common)
+        if template_id == "research_template_daily":
+            return self.submit(
+                query, mode="single",
+                max_results=builder_args["max_results"],
+                download=False, max_downloads=None,
+                summarize_limit=builder_args["max_results"],
+                analysis_enabled=False, analyze_citations=False,
+                days_back=builder_args["days_back"],
+                **{key: value for key, value in common.items()
+                   if key != "analyze_citations"})
+        raise ValueError(f"不支持的研究模板: {template_id}")
 
     def _build_template_args(self, template_id: str, query: str,
                              payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1090,29 +1077,96 @@ class ResearchWebApp:
                     "year_from": year_from, "sources": sources,
                     "download": bool(payload.get("download"))}
         if template_id == "research_template_compare":
-            # 期望用户用「主题1,主题2,主题3」分号/逗号切分;否则按单个主题
             raw = payload.get("topics")
-            if isinstance(raw, list) and len(raw) >= 2:
+            if isinstance(raw, list):
                 topics = [str(t).strip() for t in raw if str(t).strip()]
             else:
-                topics = [t.strip() for t in (query or "").replace(";", ",")
-                          .split(",") if t.strip()]
-            if len(topics) < 2:
-                topics = [query, query]  # 兜底:同主题对比
-            return {"topics": topics[:5],
+                topics = [item.strip() for item in re.split(
+                    r"[\r\n,;，；]+", query or "") if item.strip()]
+            unique_topics: List[str] = []
+            seen_topics = set()
+            for topic in topics:
+                key = topic.casefold()
+                if key not in seen_topics:
+                    unique_topics.append(topic)
+                    seen_topics.add(key)
+            if len(unique_topics) < 2:
+                raise ValueError("技术对比需要 2-5 个不同主题，请每行输入一个")
+            if len(unique_topics) > 5:
+                raise ValueError("技术对比最多支持 5 个主题")
+            return {"topics": unique_topics,
                     "max_results": _int("max_results", 6),
                     "year_from": year_from, "sources": sources}
         if template_id == "research_template_opening":
             return {"query": query,
                     "max_results": _int("max_results", 8),
-                    "year_from": year_from or 2022, "sources": sources}
+                    "year_from": year_from or (time.localtime().tm_year - 2),
+                    "sources": sources}
         if template_id == "research_template_competitor":
-            return {"papers": [{"title": query, "url": "",
-                                "source": "manual", "authors": [],
-                                "year": year_from or 2024}]}
+            raw_papers = payload.get("papers")
+            papers: List[Dict[str, Any]] = []
+            if isinstance(raw_papers, list):
+                for raw_paper in raw_papers:
+                    if not isinstance(raw_paper, dict):
+                        continue
+                    title = str(raw_paper.get("title") or "").strip()
+                    if not title:
+                        continue
+                    paper_year = raw_paper.get("year")
+                    papers.append({
+                        "title": title,
+                        "url": str(raw_paper.get("url") or ""),
+                        "source": str(raw_paper.get("source") or "manual"),
+                        "authors": list(raw_paper.get("authors") or []),
+                        "year": int(paper_year) if paper_year not in (None, "") else None,
+                        "abstract": raw_paper.get("abstract"),
+                        "doi": raw_paper.get("doi"),
+                        "pdf_url": raw_paper.get("pdf_url"),
+                        "venue": raw_paper.get("venue"),
+                        "extra": dict(raw_paper.get("extra") or {}),
+                    })
+            else:
+                entries = [item.strip() for item in re.split(
+                    r"[\r\n;；]+", query or "") if item.strip()]
+                for entry in entries:
+                    parts = [part.strip() for part in
+                             re.split(r"[|｜]", entry, maxsplit=2)]
+                    title = parts[0]
+                    url = parts[1] if len(parts) > 1 else ""
+                    raw_year = parts[2] if len(parts) > 2 else ""
+                    paper_year = (int(raw_year) if raw_year.isdigit()
+                                  and len(raw_year) == 4 else year_from)
+                    papers.append({"title": title, "url": url,
+                                   "source": "manual", "authors": [],
+                                   "year": paper_year})
+            unique_papers: List[Dict[str, Any]] = []
+            seen_titles = set()
+            for paper in papers:
+                key = str(paper.get("title") or "").casefold()
+                if key and key not in seen_titles:
+                    unique_papers.append(paper)
+                    seen_titles.add(key)
+            if len(unique_papers) < 2:
+                raise ValueError("竞品分析需要 2-8 篇不同论文，请每行输入一篇")
+            if len(unique_papers) > 8:
+                raise ValueError("竞品分析最多支持 8 篇论文")
+            raw_dimensions = payload.get("compare_dimensions")
+            if isinstance(raw_dimensions, list):
+                dimensions = [str(item).strip() for item in raw_dimensions
+                              if str(item).strip()]
+            else:
+                dimensions = [item.strip() for item in re.split(
+                    r"[,，;；]+", str(raw_dimensions or "")) if item.strip()]
+            dimensions = list(dict.fromkeys(dimensions))[:6] or [
+                "研究问题", "方法路线", "核心贡献", "已知局限"]
+            return {"papers": unique_papers,
+                    "compare_dimensions": dimensions}
         if template_id == "research_template_daily":
+            days_back = _int("days_back", 7)
+            cutoff_year = (datetime.now() - timedelta(days=days_back)).year
             return {"query": query,
-                    "days_back": _int("days_back", 7),
+                    "days_back": days_back,
+                    "year_from": cutoff_year,
                     "max_results": _int("max_results", 5), "sources": sources}
         return {"query": query}
 
@@ -1568,12 +1622,6 @@ class ResearchWebApp:
             result = self.runner(query, checkpoint=job["control"].checkpoint,
                                  **opts)
             report_path = result.get("report_path") if isinstance(result, dict) else None
-            if report_path:
-                # A completed report gets an immutable first snapshot.  Later
-                # manual snapshots let the reader preserve edits or review
-                # milestones without overwriting the original Markdown.
-                self._create_report_version_path(
-                    Path(str(report_path)), label="任务完成")
             with self.lock:
                 job = self.jobs.get(job_id)
                 if job is None:
@@ -1641,6 +1689,68 @@ class ResearchWebApp:
             _PRINT_INTERCEPTOR.set_thread_buf(None)
 
     # ------------------------------------------------------------------
+    def _daily_seen_keys(self, query: str) -> List[str]:
+        """读取每日追踪的历史论文标识，不把追踪索引混入研究记忆。"""
+        topic_id = hashlib.sha256(
+            str(query or "").strip().casefold().encode("utf-8")).hexdigest()[:24]
+        with self.lock:
+            data = self._read_json_object(
+                self.daily_tracking_path, {"version": 1, "topics": {}})
+            topics = data.get("topics") if isinstance(data.get("topics"), dict) else {}
+            entry = topics.get(topic_id) if isinstance(topics, dict) else {}
+            records = entry.get("papers") if isinstance(entry, dict) else []
+            keys: List[str] = []
+            for item in records or []:
+                if not isinstance(item, dict):
+                    continue
+                for field in ("key", "title_key"):
+                    value = str(item.get(field) or "")
+                    if value:
+                        keys.append(value)
+            return keys
+
+    def _record_daily_papers(self, query: str, papers: List[Any]) -> None:
+        """原子更新每日追踪基线；只保存标识和标题，不复制摘要或正文。"""
+        if not papers:
+            return
+        from .core.template_insights import paper_identity
+        topic_id = hashlib.sha256(
+            str(query or "").strip().casefold().encode("utf-8")).hexdigest()[:24]
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with self.lock:
+            data = self._read_json_object(
+                self.daily_tracking_path, {"version": 1, "topics": {}})
+            topics = data.setdefault("topics", {})
+            if not isinstance(topics, dict):
+                topics = {}
+                data["topics"] = topics
+            entry = topics.setdefault(topic_id, {
+                "query": str(query or "").strip(), "papers": []})
+            records = entry.get("papers") if isinstance(entry.get("papers"), list) else []
+            by_key = {str(item.get("key") or ""): dict(item)
+                      for item in records if isinstance(item, dict)
+                      and str(item.get("key") or "")}
+            for paper in papers:
+                key = paper_identity(paper)
+                if not key or key.endswith(":"):
+                    continue
+                old = by_key.get(key) or {}
+                title = str(getattr(paper, "title", "") or "")
+                by_key[key] = {
+                    "key": key,
+                    "title_key": paper_identity(title) if title else "",
+                    "title": title,
+                    "first_seen": old.get("first_seen") or now,
+                    "last_seen": now,
+                }
+            entry["papers"] = sorted(
+                by_key.values(), key=lambda item: str(item.get("last_seen") or ""),
+                reverse=True)[:1000]
+            entry["query"] = str(query or "").strip()
+            entry["updated_at"] = now
+            self._write_json_object(self.daily_tracking_path, data)
+
+    # ------------------------------------------------------------------
     def _default_runner(self, query: str, mode: str = "deep",
                         max_results: int = 10, rounds: int = 2,
                         branching: int = 1, max_queries: int = 3,
@@ -1654,6 +1764,12 @@ class ResearchWebApp:
                         analyze_citations: bool = True,
                         topics: Optional[List[str]] = None,
                         library_selection: Optional[List[Dict[str, Any]]] = None,
+                        template: Optional[str] = None,
+                        analysis_enabled: bool = True,
+                        days_back: Optional[int] = None,
+                        existing_papers: Optional[List[Dict[str, Any]]] = None,
+                        compare_dimensions: Optional[List[str]] = None,
+                        resolve_existing_papers: bool = False,
                         download_interval: float = 2.0,
                         checkpoint: Optional[Callable[[], None]] = None,
                         event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -1671,7 +1787,7 @@ class ResearchWebApp:
         from .core import (CrossPaperAnalyzer, LLMPlanner, MultiTopicComparator,
                            PaperSummarizer, ResearchAgent, ResearchLoop)
         from .plugins import DataAcquisitionPipeline
-        from .skills import (DownloaderSkill, PaperCompareSkill,
+        from .skills import (DownloaderSkill, Paper, PaperCompareSkill,
                              PaperSummarizeSkill, ReportWriteSkill)
         downloader = DownloaderSkill(
             timeout=int(self.settings.get("download_timeout", 90)),
@@ -1700,6 +1816,18 @@ class ResearchWebApp:
             "exclude_titles": list(exclude_titles or []),
             "research_direction": research_direction,
         }
+        if template:
+            overrides["template"] = str(template)
+        if compare_dimensions:
+            overrides["compare_dimensions"] = [
+                str(item).strip() for item in compare_dimensions
+                if str(item).strip()][:6]
+        if resolve_existing_papers:
+            overrides["resolve_existing_papers"] = True
+        if days_back is not None:
+            overrides["days_back"] = max(1, min(365, int(days_back)))
+        if template == "research_template_daily":
+            overrides["seen_paper_keys"] = self._daily_seen_keys(query)
         memory_reuse: List[Dict[str, Any]] = []
         # 深度模式的每轮复用由 ResearchLoop 统一管理；其它研究模式同样
         # 在启动时检索本地知识库，避免“只有深度研究才会记忆”的断层。
@@ -1724,6 +1852,21 @@ class ResearchWebApp:
                 event_callback({"kind": "library_evidence", "title": "复用本地文献",
                                 "data": {"total": len(selected_papers),
                                          "selection": library_selection}})
+        if existing_papers:
+            template_papers = [Paper.from_dict(item) for item in existing_papers
+                               if isinstance(item, dict)
+                               and str(item.get("title") or "").strip()]
+            if len(template_papers) < 2:
+                raise ValueError("竞品论文分析缺少有效文献")
+            overrides["existing_papers"] = template_papers
+            overrides["download"] = False
+            if event_callback is not None:
+                event_callback({
+                    "kind": "template_evidence",
+                    "title": "读取竞品论文清单",
+                    "data": {"total": len(template_papers),
+                             "template": template},
+                })
         if mode == "deep":
             loop = ResearchLoop(agent=agent, max_rounds=rounds,
                                 branching=branching, max_queries=max_queries,
@@ -1747,13 +1890,19 @@ class ResearchWebApp:
                     checkpoint=checkpoint,
                     **overrides)
         else:
+            # 单轮模板仍应生成报告；深度研究和多主题对比由各自的
+            # 驱动器统一生成最终报告，不能把 report 再透传给对比子任务。
+            if template:
+                overrides["report"] = True
             result = agent.run(query, max_results=max_results,
-                               summarize=True, analyze=True,
+                               summarize=True, analyze=bool(analysis_enabled),
                                checkpoint=checkpoint,
                                event_callback=event_callback,
                                **overrides)
         if mode != "deep":
             result["memory_reuse"] = memory_reuse
+        if template == "research_template_daily":
+            self._record_daily_papers(query, list(result.get("papers") or []))
         result["cost"] = self.tracker.to_dict()
         result["provider_status"] = llm.status()
         return result
@@ -3152,108 +3301,27 @@ class ResearchWebApp:
         return self._download_path(raw, {".md"})
 
     def _report_version_key(self, path: Path) -> str:
+        """计算旧版报告快照的关联键，仅用于删除报告时清理遗留数据。"""
         try:
             relative = str(path.resolve().relative_to(self.data_dir.resolve()))
         except (OSError, ValueError):
             relative = str(path.resolve())
         return hashlib.sha256(relative.encode("utf-8")).hexdigest()[:20]
 
-    def _report_versions_store(self) -> Dict[str, Any]:
-        return self._read_json_object(self.report_versions_path,
-                                      {"version": 1, "reports": {}})
-
-    def _create_report_version_path(self, path: Path, *, label: str = "手动快照"
-                                    ) -> Optional[Dict[str, Any]]:
-        """Snapshot a local Markdown report atomically, keeping at most 40."""
-        try:
-            path = path.resolve()
-            path.relative_to(self.data_dir.resolve())
-            content = path.read_text(encoding="utf-8", errors="replace")
-        except (OSError, ValueError):
-            return None
-        if path.suffix.lower() != ".md":
-            return None
+    def _delete_legacy_report_versions(self, path: Path) -> None:
+        """报告版本功能已取消；显式删除报告时同步清理旧快照。"""
         with self.lock:
-            store = self._report_versions_store()
-            reports = store.setdefault("reports", {})
-            key = self._report_version_key(path)
-            records = reports.setdefault(key, [])
-            # Avoid duplicate snapshots when a runner repeats its completion
-            # callback for the same byte-identical report within a minute.
-            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            if records and records[-1].get("sha256") == digest:
-                return dict(records[-1])
-            version_id = uuid.uuid4().hex[:16]
-            directory = self.report_versions_dir / key
-            directory.mkdir(parents=True, exist_ok=True)
-            snapshot = directory / f"{time.strftime('%Y%m%d_%H%M%S')}_{version_id}.md"
-            snapshot.write_text(content, encoding="utf-8")
-            record = {"id": version_id, "path": str(path),
-                      "name": path.name, "label": str(label or "手动快照")[:120],
-                      "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                      "sha256": digest, "size": len(content),
-                      "snapshot": str(snapshot)}
-            records.append(record)
-            stale = records[:-40]
-            reports[key] = records[-40:]
-            for old in stale:
-                old_path = self._download_path(str(old.get("snapshot") or ""), {".md"})
-                if old_path is not None:
-                    try:
-                        old_path.unlink()
-                    except OSError:
-                        pass
-            self._write_json_object(self.report_versions_path, store)
-            return dict(record)
-
-    def list_report_versions(self, raw: str) -> List[Dict[str, Any]]:
-        path = self._report_path(unquote(raw))
-        if path is None:
-            return []
-        store = self._report_versions_store()
-        records = store.get("reports", {}).get(self._report_version_key(path), [])
-        if not isinstance(records, list):
-            return []
-        result = []
-        for record in reversed(records):
-            if not isinstance(record, dict):
-                continue
-            # Public data intentionally does not contain the snapshots' local
-            # absolute path.
-            result.append({key: record.get(key) for key in
-                           ("id", "label", "created_at", "size")})
-        return result
-
-    def create_report_version(self, raw: str, label: str = "手动快照"
-                              ) -> Optional[Dict[str, Any]]:
-        path = self._report_path(unquote(raw))
-        if path is None or not path.is_file():
-            return None
-        record = self._create_report_version_path(path, label=label)
-        if record is None:
-            return None
-        return {key: record.get(key) for key in ("id", "label", "created_at", "size")}
-
-    def restore_report_version(self, raw: str, version_id: str) -> bool:
-        path = self._report_path(unquote(raw))
-        if path is None or not path.is_file():
-            return False
-        with self.lock:
-            store = self._report_versions_store()
-            records = store.get("reports", {}).get(self._report_version_key(path), [])
-            record = next((item for item in records if isinstance(item, dict)
-                           and item.get("id") == version_id), None)
-            snapshot = self._download_path(str((record or {}).get("snapshot") or ""), {".md"})
-            if snapshot is None or not snapshot.is_file():
-                return False
-            # Preserve the current version before an intentional overwrite.
-            self._create_report_version_path(path, label="恢复前自动备份")
             try:
-                path.write_text(snapshot.read_text(encoding="utf-8", errors="replace"),
-                                encoding="utf-8")
-                return True
-            except OSError:
-                return False
+                store = self._read_json_object(
+                    self.report_versions_path, {"version": 1, "reports": {}})
+                key = self._report_version_key(path)
+                if store.get("reports", {}).pop(key, None) is not None:
+                    self._write_json_object(self.report_versions_path, store)
+                version_dir = self.report_versions_dir / key
+                if version_dir.is_dir():
+                    shutil.rmtree(version_dir)
+            except (OSError, TypeError, ValueError):
+                pass
 
     def export_report(self, raw: str, fmt: str) -> Optional[Path]:
         path = self._report_path(unquote(raw))
@@ -3280,15 +3348,12 @@ class ResearchWebApp:
         root = self.data_dir
         if not root.exists():
             return []
-        versions = self._report_versions_store().get("reports", {})
         reports = []
         for path in root.glob("*.md"):
             reports.append({"path": str(path), "name": path.name,
                             "modified": time.strftime(
                                 "%Y-%m-%d %H:%M:%S",
-                                time.localtime(path.stat().st_mtime)),
-                            "version_count": len(versions.get(
-                                self._report_version_key(path), []))})
+                                time.localtime(path.stat().st_mtime))})
         # The browser handles incremental rendering.  Returning the complete
         # metadata list keeps older reports reachable instead of silently
         # hiding everything after the first 100 files.
@@ -3308,15 +3373,8 @@ class ResearchWebApp:
         if path is None or not path.exists():
             return False
         try:
-            key = self._report_version_key(path)
             path.unlink()
-            with self.lock:
-                store = self._report_versions_store()
-                if store.get("reports", {}).pop(key, None) is not None:
-                    self._write_json_object(self.report_versions_path, store)
-                version_dir = self.report_versions_dir / key
-                if version_dir.is_dir():
-                    shutil.rmtree(version_dir)
+            self._delete_legacy_report_versions(path)
             return True
         except OSError:
             return False
@@ -3619,10 +3677,6 @@ class ResearchWebApp:
                         self._send(404, json.dumps({"error": "report not found"}))
                     else:
                         self._send(200, json.dumps(report, ensure_ascii=False))
-                elif path == "/api/report-versions":
-                    raw = parse_qs(urlparse(self.path).query).get("path", [""])[0]
-                    self._send(200, json.dumps(
-                        app.list_report_versions(raw), ensure_ascii=False))
                 elif path == "/api/report-export":
                     params = parse_qs(urlparse(self.path).query)
                     try:
@@ -4306,20 +4360,6 @@ class ResearchWebApp:
                     ok = app.delete_report(str(payload.get("path") or ""))
                     self._send(200 if ok else 404, json.dumps({"ok": ok}))
                     return
-                if path == "/api/report-version":
-                    result = app.create_report_version(
-                        str(payload.get("path") or ""),
-                        str(payload.get("label") or "手动快照"))
-                    self._send(200 if result else 404, json.dumps(
-                        {"version": result} if result else {"error": "report not found"},
-                        ensure_ascii=False))
-                    return
-                if path == "/api/report-version-restore":
-                    ok = app.restore_report_version(
-                        str(payload.get("path") or ""),
-                        str(payload.get("version_id") or ""))
-                    self._send(200 if ok else 404, json.dumps({"ok": ok}))
-                    return
                 if path != "/api/run":
                     self._send(404, json.dumps({"error": "not found"}))
                     return
@@ -4335,13 +4375,18 @@ class ResearchWebApp:
                     return
                 template = str(payload.get("template") or "").strip()
                 try:
+                    options = research_options()
                     if template:
-                        # 走研究模板 Skill,模板内部决定怎么调 Agent/Comparator
+                        template_options = dict(options)
+                        for key in ("topics", "papers", "days_back",
+                                    "compare_dimensions"):
+                            if key in payload:
+                                template_options[key] = payload[key]
                         job_id = app.submit_template(
-                            template, query, payload)
+                            template, query, template_options)
                     else:
                         job_id = app.submit(
-                            query, mode=mode, **research_options())
+                            query, mode=mode, **options)
                     self._send(200, json.dumps({"job_id": job_id}))
                 except (TypeError, ValueError) as err:
                     self._send(400, json.dumps({"error": str(err)},

@@ -85,6 +85,7 @@ class ResearchLoop:
         # 这样 max_downloads 是整个研究任务的上限，而不是每个派生查询的上限。
         deferred_download = overrides.get("download") is True
         round_overrides = dict(overrides)
+        template = str(round_overrides.pop("template", "") or "")
         excluded_titles = {
             _normalize_title(str(title)) for title in
             (overrides.get("exclude_titles") or [])
@@ -297,6 +298,14 @@ class ResearchLoop:
             "papers_raw": sum(len(rec["papers"]) for rec in rounds),
             "papers_dedup": len(all_papers),
         }
+        if template:
+            meta["template"] = template
+        if template == "research_template_survey":
+            from .template_insights import build_survey_insights
+            meta["template_insights"] = build_survey_insights(
+                rounds, all_papers)
+            self._emit(event_callback, "template_insights",
+                       "系统综述证据地图", meta["template_insights"])
         self._checkpoint(checkpoint)
         report_path = self.reporter.write_deep(
             meta, rounds, all_papers, citations=citations,

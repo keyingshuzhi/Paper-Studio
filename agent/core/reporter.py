@@ -139,14 +139,24 @@ class Reporter:
                     citations: Optional[Dict[str, Any]] = None,
                     acquisition: Optional[Dict[str, Any]] = None) -> str:
         """渲染多轮深度研究报告。"""
+        template_insights = (meta.get("template_insights")
+                             if isinstance(meta.get("template_insights"), dict)
+                             else {})
+        report_name = ("系统综述报告" if
+                       template_insights.get("kind") == "survey"
+                       else "深度研究报告")
         lines: List[str] = [
-            f"# 深度研究报告：{meta['root_query']}",
+            f"# {report_name}：{meta['root_query']}",
             "",
             f"- **开始时间**：{meta.get('started_at', '')}",
             f"- **研究轮次**：{meta['rounds']} 轮",
             f"- **查询总数**：{meta['queries']} 次",
             f"- **文献总量**：{meta['papers_raw']} 篇 → "
             f"去重后 {meta['papers_dedup']} 篇",
+        ]
+        if template_insights:
+            lines += self._render_template_insights(template_insights)
+        lines += [
             "",
             "---",
             "",
@@ -295,13 +305,28 @@ class Reporter:
                analysis: Optional[Dict[str, Any]] = None) -> str:
         """渲染 Markdown 报告内容。"""
         now = time.strftime("%Y-%m-%d %H:%M:%S")
+        template_insights = (analysis.get("template_insights")
+                             if isinstance(analysis, dict)
+                             and isinstance(analysis.get("template_insights"), dict)
+                             else {})
+        report_names = {
+            "opening": "开题调研报告",
+            "competitor": "竞品论文分析报告",
+            "daily": "每日文献追踪",
+        }
+        report_name = report_names.get(
+            str(template_insights.get("kind") or ""), "学术检索报告")
         lines: List[str] = [
-            f"# 学术检索报告：{plan.query}",
+            f"# {report_name}：{plan.query}",
             "",
             f"- **检索时间**：{now}",
             f"- **用户输入**：{plan.original_query}",
             f"- **来源**：{'、'.join(self._source_names(papers)) or '无'}",
             f"- **命中文献**：{len(papers)} 篇（多源去重后）",
+        ]
+        if template_insights:
+            lines += self._render_template_insights(template_insights)
+        lines += [
             "",
             "---",
             "",
@@ -346,18 +371,18 @@ class Reporter:
             "",
             "---",
             "",
-            "## 下一步建议（V2.0 能力预告）",
+            "## 建议行动",
             "",
-            "1. **智能摘要**：为每篇文献提炼 问题/方法/贡献/局限。",
-            "2. **观点对比**：跨文献对比共识点与分歧点。",
-            "3. **知识盲点预警**：识别研究空白，推荐新课题方向。",
+            "1. 优先精读与研究问题最相关的代表文献，核验全文证据。",
+            "2. 对关键方法、数据集和评价指标做可比较的证据表。",
+            "3. 将尚未解决的空白转换为下一轮检索或可验证假设。",
             "",
         ]
 
         # 智能摘要段（放在"下一步建议"之前更合理，故插到列表前）
         if summaries:
             block = self._render_summaries(summaries)
-            idx = lines.index("## 下一步建议（V2.0 能力预告）")
+            idx = lines.index("## 建议行动")
             lines[idx:idx] = block
 
         # 跨文献分析段（插在摘要段之前、文献清单之后）
@@ -366,15 +391,145 @@ class Reporter:
         if reuse_block:
             idx = lines.index("## 文献智能摘要（问题 / 方法 / 贡献 / 局限）") \
                 if "## 文献智能摘要（问题 / 方法 / 贡献 / 局限）" in lines \
-                else lines.index("## 下一步建议（V2.0 能力预告）")
+                else lines.index("## 建议行动")
             lines[idx:idx] = reuse_block
         if self._analysis_has_content(analysis):
             block = self._render_analysis(analysis)
             idx = lines.index("## 文献智能摘要（问题 / 方法 / 贡献 / 局限）") \
                 if "## 文献智能摘要（问题 / 方法 / 贡献 / 局限）" in lines \
-                else lines.index("## 下一步建议（V2.0 能力预告）")
+                else lines.index("## 建议行动")
             lines[idx:idx] = block
         return "\n".join(lines)
+
+    @staticmethod
+    def _render_template_insights(insights: Dict[str, Any]) -> List[str]:
+        """渲染模板专属决策视图，使每种模板拥有不同的报告价值。"""
+        kind = str(insights.get("kind") or "")
+        title = str(insights.get("title") or "模板分析")
+        lines: List[str] = ["", "---", "", f"## {title}", ""]
+        if kind == "survey":
+            coverage = insights.get("coverage") or {}
+            lines += [
+                "| 证据维度 | 覆盖情况 |",
+                "|----------|----------|",
+                f"| 去重文献 | {coverage.get('papers', 0)} 篇 |",
+                f"| 数据来源 | {coverage.get('sources', 0)} 类 |",
+                f"| 研究轮次 | {coverage.get('rounds', 0)} 轮 |",
+                f"| 年份跨度 | {Reporter._table_cell(coverage.get('year_span', '年份待核验'))} |",
+                f"| 摘要覆盖 | {float(coverage.get('abstract_coverage') or 0):.0%} |",
+                "",
+            ]
+            distribution = insights.get("source_distribution") or []
+            if distribution:
+                lines += ["### 来源分布", "", "、".join(
+                    f"{item.get('source')} {item.get('count', 0)} 篇"
+                    for item in distribution if isinstance(item, dict)), ""]
+            for key, heading in (
+                    ("method_landscape", "代表方法谱系"),
+                    ("representative_contributions", "代表性贡献"),
+                    ("consensus", "跨轮共识"),
+                    ("conflicts", "关键争议"),
+                    ("gaps", "优先研究空白")):
+                items = insights.get(key) or []
+                if items:
+                    lines += [f"### {heading}", ""]
+                    lines += [f"{index}. {item}" for index, item in
+                              enumerate(items, 1)] + [""]
+        elif kind == "opening":
+            lines += [
+                f"> **选题判断：{insights.get('verdict', '需要更多证据')}**",
+                f"> 证据成熟度：{int(insights.get('evidence_score') or 0)}/100。"
+                f"{insights.get('reason', '')}", "",
+            ]
+            questions = insights.get("research_questions") or []
+            if questions:
+                lines += ["### 可落地研究问题", ""]
+                for index, item in enumerate(questions, 1):
+                    if not isinstance(item, dict):
+                        continue
+                    lines.append(f"{index}. **{item.get('question', '')}**")
+                    if item.get("evidence"):
+                        lines.append(f"   - 依据：{item['evidence']}")
+                    if item.get("search"):
+                        lines.append(f"   - 建议检索：`{item['search']}`")
+                lines.append("")
+            for key, heading in (("method_routes", "可选方法路线"),
+                                 ("novelty_opportunities", "潜在创新空间"),
+                                 ("risks", "风险与前置条件"),
+                                 ("next_steps", "下一步开题动作")):
+                items = insights.get(key) or []
+                if items:
+                    lines += [f"### {heading}", ""] + [
+                        f"- {item}" for item in items] + [""]
+        elif kind == "competitor":
+            dimensions = [str(item) for item in insights.get("dimensions") or []]
+            lines += [
+                f"> 已为 {insights.get('evidence_resolved', 0)}/"
+                f"{insights.get('evidence_total', 0)} 篇论文补齐摘要或标准标识。",
+                "",
+            ]
+            if dimensions:
+                lines += [
+                    "| 论文 | 年份 | " + " | ".join(
+                        Reporter._table_cell(item) for item in dimensions) + " |",
+                    "|------|------|" + "------|" * len(dimensions),
+                ]
+                for row in insights.get("rows") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    cells = list(row.get("cells") or [])
+                    lines.append("| " + Reporter._table_cell(row.get("paper"))
+                                 + " | " + Reporter._table_cell(row.get("year") or "—")
+                                 + " | " + " | ".join(
+                                     Reporter._table_cell(cells[index] if index < len(cells)
+                                                          else "需结合全文核验")
+                                     for index in range(len(dimensions))) + " |")
+                lines.append("")
+            recommendations = insights.get("recommendations") or []
+            if recommendations:
+                lines += ["### 优势与取舍", ""]
+                for item in recommendations:
+                    if isinstance(item, dict):
+                        lines += [f"- **{item.get('paper', '')}**",
+                                  f"  - 优势：{item.get('strength', '')}",
+                                  f"  - 取舍：{item.get('tradeoff', '')}"]
+                lines.append("")
+        elif kind == "daily":
+            lines += [
+                f"> **{insights.get('status', '追踪完成')}**",
+                "",
+                "| 追踪指标 | 数量 |",
+                "|----------|------|",
+                f"| 检索候选 | {insights.get('searched_count', 0)} |",
+                f"| 窗口内匹配 | {insights.get('matched_count', insights.get('new_count', 0))} |",
+                f"| 新增文献 | {insights.get('new_count', 0)} |",
+                f"| 留待下期 | {insights.get('deferred_count', 0)} |",
+                f"| 历史去重 | {insights.get('already_seen_count', 0)} |",
+                f"| 窗口外过滤 | {insights.get('outside_window_count', 0)} |",
+                f"| 精确日期可核验 | {insights.get('exact_date_count', 0)} |",
+                f"| 日期待核验 | {insights.get('approximate_date_count', 0)} |",
+                "",
+                f"- 时间范围：最近 {insights.get('days_back', 7)} 天"
+                f"（截止日 {insights.get('cutoff', '')}）",
+            ]
+            keywords = insights.get("trend_keywords") or []
+            if keywords:
+                lines += [f"- 趋势词：{'、'.join(str(item) for item in keywords)}"]
+            lines += ["", "### 新增证据信号", ""]
+            highlights = insights.get("highlights") or []
+            if highlights:
+                for item in highlights:
+                    if isinstance(item, dict):
+                        lines.append(f"- **{item.get('title', '')}**"
+                                     f"（{item.get('date', '')}）：{item.get('signal', '')}")
+            else:
+                lines.append("- 当前时间窗口内没有未读新文献，无需重复摘要。")
+            lines += ["", f"**建议动作**：{insights.get('next_action', '')}", ""]
+        return lines
+
+    @staticmethod
+    def _table_cell(value: Any) -> str:
+        return str(value or "").replace("|", "\\|").replace("\n", " ").strip()
 
     @staticmethod
     def _render_memory_reuse(items: List[Dict[str, Any]]) -> List[str]:

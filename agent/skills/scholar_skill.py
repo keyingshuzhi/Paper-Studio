@@ -18,7 +18,10 @@ from .base import BaseSkill, SkillPermission
 from .metadata import PAPER_SCHEMA, Paper
 
 _S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
-_S2_FIELDS = "title,authors,year,abstract,externalIds,url,openAccessPdf,venue"
+_S2_FIELDS = (
+    "title,authors,year,abstract,externalIds,url,openAccessPdf,venue,"
+    "publicationDate"
+)
 _CROSSREF_API = "https://api.crossref.org/works"
 
 
@@ -142,7 +145,8 @@ class ScholarSkill(BaseSkill):
                 doi=ext.get("DOI"),
                 pdf_url=pdf_url,
                 venue=item.get("venue"),
-                extra={"s2_paper_id": item.get("paperId")},
+                extra={"s2_paper_id": item.get("paperId"),
+                       "published_date": item.get("publicationDate")},
             ))
         return papers
 
@@ -162,6 +166,12 @@ class ScholarSkill(BaseSkill):
             issued = item.get("issued", {}).get("date-parts", [[None]])
             if issued and issued[0] and issued[0][0]:
                 year = int(issued[0][0])
+            issued_parts = issued[0] if issued and issued[0] else []
+            published_date = ""
+            if issued_parts and issued_parts[0]:
+                published_date = "-".join(
+                    [str(int(issued_parts[0])).zfill(4)] +
+                    [str(int(value)).zfill(2) for value in issued_parts[1:3]])
             authors = []
             for a in item.get("author", []):
                 name = " ".join(
@@ -181,5 +191,6 @@ class ScholarSkill(BaseSkill):
                 abstract=abstract,
                 doi=item.get("DOI"),
                 venue=(item.get("container-title") or [""])[0] or None,
+                extra={"published_date": published_date},
             ))
         return papers

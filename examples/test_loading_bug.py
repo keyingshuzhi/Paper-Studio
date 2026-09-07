@@ -126,7 +126,7 @@ def main() -> None:
             data = r.read().decode()
         import json
         j = json.loads(data)
-        expect("version == 0.1.0", j.get("version") == "0.1.0")
+        expect("version == 0.1.1", j.get("version") == "0.1.1")
         expect("stats 完整", "stats" in j and j["stats"].get("skills", 0) >= 25)
         expect("capabilities 6 个", len(j.get("capabilities", [])) == 6)
         expect("skill_categories 3 类", len(j.get("skill_categories", {})) >= 3)
