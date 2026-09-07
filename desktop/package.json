@@ -32,13 +32,13 @@
     ],
     "mac": {
       "category": "public.app-category.productivity",
-      "icon": "assets/icon.icns",
+      "icon": "assets/icon-mac.icns",
       "target": ["dmg", "zip"],
       "artifactName": "${productName}-${version}-${arch}.${ext}",
       "identity": null
     },
     "win": {
-      "icon": "assets/icon.png",
+      "icon": "assets/icon-windows.ico",
       "target": ["nsis", "zip"],
       "artifactName": "${productName}-${version}-${arch}.${ext}"
     },
